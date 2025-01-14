@@ -12,6 +12,7 @@ import (
 	"golang.org/x/text/transform"
 
 	"github.com/jumpserver/koko/pkg/common"
+	"github.com/jumpserver/koko/pkg/logger"
 )
 
 func NewTelnetConnection(opts ...TelnetOption) (*TelnetConnection, error) {
@@ -72,13 +73,23 @@ func NewTelnetConnection(opts ...TelnetOption) (*TelnetConnection, error) {
 			transformWriter = transform.NewWriter(client, writerEncode)
 		}
 	}
-	return &TelnetConnection{
+	tCon := &TelnetConnection{
 		cfg:             cfg,
 		conn:            client,
 		proxyConn:       proxyClient,
 		transformReader: transformReader,
 		transformWriter: transformWriter,
-	}, nil
+	}
+	if cfg.suCfg != nil {
+		if err = LoginToTelnetSu(tCon); err != nil {
+			_ = tCon.Close()
+			logger.Errorf("Telnet Login to su user %s failed: %s",
+				cfg.suCfg.SudoUsername, err)
+			return nil, err
+		}
+	}
+	_, _ = tCon.Write([]byte("\r\n"))
+	return tCon, nil
 }
 
 func newTelnetClient(conn net.Conn, cfg *TelnetConfig) (*tclientlib.Client, error) {
@@ -108,7 +119,9 @@ func newTelnetClient(conn net.Conn, cfg *TelnetConfig) (*tclientlib.Client, erro
 			High:     cfg.win.Height,
 			TermType: cfg.Term,
 		},
-		LoginSuccessRegex: cfg.CustomSuccessPattern,
+		LoginSuccessPromptRegex: cfg.CustomSuccessPattern,
+		UsernamePromptRegex:     cfg.CustomUsernamePattern,
+		PasswordPromptRegex:     cfg.CustomPasswordPattern,
 	})
 	close(done)
 	if err != nil {
@@ -125,10 +138,6 @@ type TelnetConnection struct {
 	transformReader io.Reader
 	transformWriter io.Writer
 	once            sync.Once
-}
-
-func (tc *TelnetConnection) Protocol() string {
-	return "telnet"
 }
 
 func (tc *TelnetConnection) KeepAlive() error {
@@ -167,11 +176,15 @@ type TelnetConfig struct {
 	Term     string
 	Charset  string
 
+	suCfg *SuConfig
+
 	Timeout time.Duration
 
 	win Windows
 
-	CustomSuccessPattern *regexp.Regexp
+	CustomSuccessPattern  *regexp.Regexp
+	CustomUsernamePattern *regexp.Regexp
+	CustomPasswordPattern *regexp.Regexp
 
 	proxySSHClientOptions []SSHClientOptions
 }
@@ -227,5 +240,23 @@ func TelnetCharset(charset string) TelnetOption {
 func TelnetCustomSuccessPattern(successPattern *regexp.Regexp) TelnetOption {
 	return func(opt *TelnetConfig) {
 		opt.CustomSuccessPattern = successPattern
+	}
+}
+
+func TelnetCustomUsernamePattern(usernamePrompt *regexp.Regexp) TelnetOption {
+	return func(opt *TelnetConfig) {
+		opt.CustomUsernamePattern = usernamePrompt
+	}
+}
+
+func TelnetCustomPasswordPattern(passwordPrompt *regexp.Regexp) TelnetOption {
+	return func(opt *TelnetConfig) {
+		opt.CustomPasswordPattern = passwordPrompt
+	}
+}
+
+func TelnetSuConfig(cfg *SuConfig) TelnetOption {
+	return func(opt *TelnetConfig) {
+		opt.suCfg = cfg
 	}
 }

@@ -2,15 +2,13 @@ package service
 
 import (
 	"fmt"
+	"strings"
+
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
 )
 
-func (s *JMService) CreateShareRoom(sessionId string, expired int, users []string) (res model.SharingSession, err error) {
-	postData := make(map[string]interface{})
-	postData["session"] = sessionId
-	postData["expired_time"] = expired
-	postData["users"] = users
-	_, err = s.authClient.Post(ShareCreateURL, postData, &res)
+func (s *JMService) CreateShareRoom(data model.SharingSessionRequest) (res model.SharingSession, err error) {
+	_, err = s.authClient.Post(ShareCreateURL, data, &res)
 	return
 }
 
@@ -22,7 +20,7 @@ func (s *JMService) GetShareUserInfo(query string) (res []*model.MiniUser, err e
 	return
 }
 
-func (s *JMService) JoinShareRoom(data SharePostData) (res model.ShareRecord, err error) {
+func (s *JMService) JoinShareRoom(data model.SharePostData) (res model.ShareRecord, err error) {
 	_, err = s.authClient.Post(ShareSessionJoinURL, data, &res)
 	return
 }
@@ -33,9 +31,35 @@ func (s *JMService) FinishShareRoom(recordId string) (err error) {
 	return
 }
 
-type SharePostData struct {
-	ShareId    string `json:"sharing"`
-	Code       string `json:"verify_code"`
-	UserId     string `json:"joiner"`
-	RemoteAddr string `json:"remote_addr"`
+func (s *JMService) SyncUserKokoPreference(cookies map[string]string, data model.UserKokoPreference) (err error) {
+	/*
+		csrfToken 存储在 cookies 中
+		其 使用的名称 name 为 `{SESSION_COOKIE_NAME_PREFIX}csrftoken` 动态组成
+	*/
+	var (
+		csrfToken  string
+		namePrefix string
+	)
+	checkNamePrefixValid := func(name string) bool {
+		invalidStrings := []string{`""`, `''`}
+		for _, invalidString := range invalidStrings {
+			if strings.Contains(name, invalidString) {
+				return false
+			}
+		}
+		return true
+	}
+	namePrefix = cookies["SESSION_COOKIE_NAME_PREFIX"]
+	csrfCookieName := "csrftoken"
+	if namePrefix != "" && checkNamePrefixValid(namePrefix) {
+		csrfCookieName = namePrefix + csrfCookieName
+	}
+	csrfToken = cookies[csrfCookieName]
+	client := s.authClient.Clone()
+	client.SetHeader("X-CSRFToken", csrfToken)
+	for k, v := range cookies {
+		client.SetCookie(k, v)
+	}
+	_, err = client.Patch(UserKoKoPreferenceURL, data, nil)
+	return
 }

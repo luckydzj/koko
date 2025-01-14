@@ -2,15 +2,20 @@
 <head>
     <title></title>
     <link rel="shortcut icon" href="{{ .IconURL }}" type="image/x-icon">
+    <link rel="stylesheet" type="text/css" media="screen" href="/koko/static/js/jquery-ui-1.12.1.min.css">
+    <link rel="stylesheet" type="text/css" media="screen" href="/koko/static/plugins/elfinder/css/elfinder.full.css">
+    <link rel="stylesheet" type="text/css" media="screen" href="/koko/static/plugins/elfinder/css/theme-jms.css">
+    <style>
+        .elfinder .elfinder-toast > .toast-success:before {
+             content: '';
+        }
+    </style>
 </head>
 <body style="margin: 0">
     <script type="text/javascript" src="/koko/static/js/jquery-3.3.1.js"></script>
     <script type="text/javascript" src="/koko/static/js/jquery-ui-1.12.1.js"></script>
     <script type="text/javascript" src="/koko/static/plugins/elfinder/elfinder.full.js"></script>
     <script type="text/javascript" src="/koko/static/plugins/elfinder/i18n/elfinder.pl.js"></script>
-    <link rel="stylesheet" type="text/css" media="screen" href="/koko/static/js/jquery-ui-1.12.1.min.css">
-    <link rel="stylesheet" type="text/css" media="screen" href="/koko/static/plugins/elfinder/css/elfinder.full.css">
-    <link rel="stylesheet" type="text/css" media="screen" href="/koko/static/plugins/elfinder/css/theme-gray.css">
     <script type="text/javascript" src="/koko/static/js/koko.js"></script>
     <script type="text/javascript" charset="utf-8">
         var urlParams = new URLSearchParams(window.location.search);
@@ -21,10 +26,16 @@
         var targetId = {{ .ID }};
         requireParams.append('type', "elfinder");
         requireParams.append('target_id', targetId );
+        for (var key of urlParams.keys()) {
+            if (key !== "type" && key !== "target_id") {
+                requireParams.append(key, urlParams.get(key));
+            }
+        }
         var wsURL = baseWsUrl + requireParams.toString();
         let ws = new WebSocket(wsURL, ["JMS-KOKO"]);
         let interval;
         let wsId = '';
+        var tokenId = requireParams.get('token');
 
         var lunaId, origin;
         function handleEventFromLuna(evt) {
@@ -80,6 +91,12 @@
                     break
                 case "PING":
                     break
+                case "ERROR":
+                    alert(msg.err)
+                    break
+                case "TERMINAL_ERROR":
+                    alert(msg.err)
+                    break
                 default:
                     console.log(msg)
             }
@@ -92,7 +109,7 @@
             ['rename'],
             ['view'],
         ];
-        if (targetId === '_') {
+        if (tokenId === null || tokenId === undefined || tokenId === "") {
             toolbar.push(['search'])
         }
         var url = '/koko/elfinder/connector/'+ targetId + '/';
@@ -106,6 +123,7 @@
                 customData: {'sid': sid},
                 customHeaders: {"JMS-KoKo-Request-ID": sid},
                 width: '100%',
+                height: '100%',
 	    		url: url,
                 resizable: false,
                 lang: 'pl',
@@ -152,7 +170,7 @@
             }
             var kokoLang = getCookieByName("django_language");
             if ( kokoLang.startsWith("en")) {
-                document.title = "File Manager"
+                document.title = "File explorer"
             }else if (kokoLang.startsWith("ja")) {
                 document.title = "ファイル管理"
             } else {
@@ -224,6 +242,7 @@
     <style type="text/css">
         body {
             height: 100%;
+            font-family: "Open Sans","Helvetica Neue",Helvetica,Arial,sans-serif;
         }
         .div #elfinder {
             height: 100%;

@@ -11,6 +11,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 	"github.com/xlab/treeprint"
+	"golang.org/x/term"
 
 	"github.com/jumpserver/koko/pkg/common"
 	"github.com/jumpserver/koko/pkg/config"
@@ -24,13 +25,19 @@ import (
 func NewInteractiveHandler(sess ssh.Session, user *model.User, jmsService *service.JMService,
 	termConfig model.TerminalConfig) *InteractiveHandler {
 	wrapperSess := NewWrapperSession(sess)
-	term := utils.NewTerminal(wrapperSess, "Opt> ")
+	publicSetting, err := jmsService.GetPublicSetting()
+	if err != nil {
+		logger.Errorf("Get public setting error: %s", err)
+	}
+	vt := term.NewTerminal(wrapperSess, "Opt> ")
 	handler := &InteractiveHandler{
 		sess:         wrapperSess,
 		user:         user,
-		term:         term,
+		term:         vt,
 		jmsService:   jmsService,
 		terminalConf: &termConfig,
+
+		publicSetting: &publicSetting,
 	}
 	handler.Initial()
 	return handler
@@ -80,7 +87,7 @@ func checkMaxIdleTime(maxIdleMinutes int, langCode string, user *model.User, ses
 type InteractiveHandler struct {
 	sess *WrapperSession
 	user *model.User
-	term *utils.Terminal
+	term *term.Terminal
 
 	selectHandler *UserSelectHandler
 
@@ -94,6 +101,8 @@ type InteractiveHandler struct {
 
 	terminalConf *model.TerminalConfig
 
+	publicSetting *model.PublicSetting
+
 	i18nLang string
 }
 
@@ -105,10 +114,17 @@ func (h *InteractiveHandler) Initial() {
 	h.assetLoadPolicy = strings.ToLower(conf.AssetLoadPolicy)
 	h.i18nLang = getUserDefaultLangCode(h.user)
 	h.displayHelp()
+	hiddenFields := make(map[string]struct{})
+	for i := range conf.HiddenFields {
+		name := strings.TrimSpace(strings.ToLower(conf.HiddenFields[i]))
+		hiddenFields[name] = struct{}{}
+	}
 	h.selectHandler = &UserSelectHandler{
 		user:     h.user,
 		h:        h,
 		pageInfo: &pageInfo{},
+
+		hiddenFields: hiddenFields,
 	}
 	switch h.assetLoadPolicy {
 	case "all":
@@ -122,6 +138,12 @@ func (h *InteractiveHandler) Initial() {
 
 }
 
+func (h *InteractiveHandler) GetPtySize() (int, int) {
+	// todo: 优化直接存储
+	pty := h.sess.Pty()
+	return pty.Window.Width, pty.Window.Height
+}
+
 func (h *InteractiveHandler) firstLoadData() {
 	h.wg.Add(1)
 	go func() {
@@ -133,6 +155,7 @@ func (h *InteractiveHandler) firstLoadData() {
 func (h *InteractiveHandler) displayHelp() {
 	h.term.SetPrompt("Opt> ")
 	h.displayBanner(h.sess, h.user.Name, h.terminalConf)
+	h.displayAnnouncement(h.sess, h.publicSetting)
 }
 
 func (h *InteractiveHandler) WatchWinSizeChange(winChan <-chan ssh.Window) {
@@ -171,22 +194,20 @@ func (h *InteractiveHandler) keepSessionAlive(keepAliveTime time.Duration) {
 	}
 }
 
-func (h *InteractiveHandler) chooseSystemUser(systemUsers []model.SystemUser) (systemUser model.SystemUser, ok bool) {
+func (h *InteractiveHandler) chooseAccount(permAccounts []model.PermAccount) (model.PermAccount, bool) {
 	lang := i18n.NewLang(h.i18nLang)
-	length := len(systemUsers)
+	length := len(permAccounts)
 	switch length {
 	case 0:
-		warningInfo := lang.T("No system user found.")
+		warningInfo := lang.T("No account found.")
 		_, _ = io.WriteString(h.term, warningInfo+"\n\r")
-		return model.SystemUser{}, false
+		return model.PermAccount{}, false
 	case 1:
-		return systemUsers[0], true
+		return permAccounts[0], true
 	default:
 	}
-	displaySystemUsers := selectHighestPrioritySystemUsers(systemUsers)
-	if len(displaySystemUsers) == 1 {
-		return displaySystemUsers[0], true
-	}
+	displayAccounts := model.PermAccountList(permAccounts)
+	sort.Sort(displayAccounts)
 
 	idLabel := lang.T("ID")
 	nameLabel := lang.T("Name")
@@ -195,15 +216,15 @@ func (h *InteractiveHandler) chooseSystemUser(systemUsers []model.SystemUser) (s
 	labels := []string{idLabel, nameLabel, usernameLabel}
 	fields := []string{"ID", "Name", "Username"}
 
-	data := make([]map[string]string, len(displaySystemUsers))
-	for i, j := range displaySystemUsers {
+	data := make([]map[string]string, len(displayAccounts))
+	for i, j := range displayAccounts {
 		row := make(map[string]string)
 		row["ID"] = strconv.Itoa(i + 1)
 		row["Name"] = j.Name
 		row["Username"] = j.Username
 		data[i] = row
 	}
-	w, _ := h.term.GetSize()
+	w, _ := h.GetPtySize()
 	table := common.WrapperTable{
 		Fields: fields,
 		Labels: labels,
@@ -217,11 +238,12 @@ func (h *InteractiveHandler) chooseSystemUser(systemUsers []model.SystemUser) (s
 		TruncPolicy: common.TruncMiddle,
 	}
 	table.Initial()
+	userHandler := h.selectHandler
 
 	h.term.SetPrompt("ID> ")
-	selectTip := lang.T("Tips: Enter system user ID and directly login")
+	selectTip := fmt.Sprintf(lang.T("Tips: Enter asset[%s] account ID"), userHandler.selectedAsset.String())
 	backTip := lang.T("Back: B/b")
-	for {
+	for i := 0; i < 3; i++ {
 		utils.IgnoreErrWriteString(h.term, table.Display())
 		utils.IgnoreErrWriteString(h.term, utils.WrapperString(selectTip, utils.Green))
 		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
@@ -229,19 +251,103 @@ func (h *InteractiveHandler) chooseSystemUser(systemUsers []model.SystemUser) (s
 		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
 		line, err := h.term.ReadLine()
 		if err != nil {
-			return
+			logger.Errorf("select account err: %s", err)
+			return model.PermAccount{}, false
 		}
 		line = strings.TrimSpace(line)
 		switch strings.ToLower(line) {
 		case "q", "b", "quit", "exit", "back":
-			return
+			logger.Info("select account cancel")
+			return model.PermAccount{}, false
+		case "":
+			continue
 		}
-		if num, err := strconv.Atoi(line); err == nil {
-			if num > 0 && num <= len(displaySystemUsers) {
-				return displaySystemUsers[num-1], true
+		if num, err2 := strconv.Atoi(line); err2 == nil {
+			if num > 0 && num <= len(displayAccounts) {
+				return displayAccounts[num-1], true
 			}
 		}
 	}
+	maxTryTip := lang.T("Select account exceed max retry times.")
+	utils.IgnoreErrWriteString(h.term, utils.WrapperWarn(maxTryTip))
+	utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+	return model.PermAccount{}, false
+}
+
+func (h *InteractiveHandler) chooseAssetProtocol(protocols []string) (string, bool) {
+	lang := i18n.NewLang(h.i18nLang)
+	length := len(protocols)
+	switch length {
+	case 0:
+		warningInfo := lang.T("No protocol found.")
+		_, _ = io.WriteString(h.term, warningInfo+"\n\r")
+		return "", false
+	case 1:
+		return protocols[0], true
+	default:
+	}
+	displayProtocols := protocols
+
+	idLabel := lang.T("ID")
+	nameLabel := lang.T("Protocol")
+
+	labels := []string{idLabel, nameLabel}
+	fields := []string{"ID", "Protocol"}
+
+	data := make([]map[string]string, len(displayProtocols))
+	for i := range displayProtocols {
+		row := make(map[string]string)
+		row["ID"] = strconv.Itoa(i + 1)
+		row["Protocol"] = displayProtocols[i]
+		data[i] = row
+	}
+	w, _ := h.GetPtySize()
+	table := common.WrapperTable{
+		Fields: fields,
+		Labels: labels,
+		FieldsSize: map[string][3]int{
+			"ID":       {0, 0, 5},
+			"Protocol": {0, 8, 0},
+		},
+		Data:        data,
+		TotalSize:   w,
+		TruncPolicy: common.TruncMiddle,
+	}
+	table.Initial()
+
+	h.term.SetPrompt("ID> ")
+	selectTip := lang.T("Tips: Enter protocol ID")
+	backTip := lang.T("Back: B/b")
+	for i := 0; i < 3; i++ {
+		utils.IgnoreErrWriteString(h.term, table.Display())
+		utils.IgnoreErrWriteString(h.term, utils.WrapperString(selectTip, utils.Green))
+		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+		utils.IgnoreErrWriteString(h.term, utils.WrapperString(backTip, utils.Green))
+		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+		line, err := h.term.ReadLine()
+		if err != nil {
+			logger.Errorf("select protocol err: %s", err)
+			return "", false
+		}
+		line = strings.TrimSpace(line)
+		switch strings.ToLower(line) {
+		case "q", "b", "quit", "exit", "back":
+			logger.Info("select account cancel")
+			return "", false
+		case "":
+			continue
+		}
+		if num, err2 := strconv.Atoi(line); err2 == nil {
+			if num > 0 && num <= len(displayProtocols) {
+				return displayProtocols[num-1], true
+			}
+		}
+	}
+	maxTryTip := lang.T("Select protocol exceed max retry times.")
+	utils.IgnoreErrWriteString(h.term, utils.WrapperWarn(maxTryTip))
+	utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+	time.Sleep(time.Millisecond * 500)
+	return "", false
 }
 
 func (h *InteractiveHandler) refreshAssetsAndNodesData() {
@@ -289,31 +395,13 @@ func (h *InteractiveHandler) loadUserNodes() {
 	h.nodes = nodes
 }
 
-func selectHighestPrioritySystemUsers(systemUsers []model.SystemUser) []model.SystemUser {
-	length := len(systemUsers)
-	if length == 0 {
-		return systemUsers
-	}
-	var result = make([]model.SystemUser, 0)
-	model.SortSystemUserByPriority(systemUsers)
-
-	highestPriority := systemUsers[0].Priority
-	result = append(result, systemUsers[0])
-	for i := 1; i < length; i++ {
-		if highestPriority == systemUsers[i].Priority {
-			result = append(result, systemUsers[i])
-		}
-	}
-	return result
-}
-
-func getPageSize(term *utils.Terminal, termConf *model.TerminalConfig) int {
+func getPageSize(h *InteractiveHandler, termConf *model.TerminalConfig) int {
 	var (
 		pageSize  int
 		minHeight = 8 // 分页显示的最小高度
 
 	)
-	_, height := term.GetSize()
+	_, height := h.GetPtySize()
 
 	AssetListPageSize := termConf.AssetListPageSize
 	switch AssetListPageSize {
@@ -334,27 +422,26 @@ func getPageSize(term *utils.Terminal, termConf *model.TerminalConfig) int {
 	return pageSize
 }
 
-func ConstructNodeTree(assetNodes []model.Node) treeprint.Tree {
+func ConstructNodeTree(assetNodes []model.Node) (treeprint.Tree, []model.Node) {
 	model.SortNodesByKey(assetNodes)
-	keyIndexMap := make(map[string]int)
-	for index := range assetNodes {
-		keyIndexMap[assetNodes[index].Key] = index
-	}
 	rootTree := treeprint.New()
-	constructDisplayTree(rootTree, convertToDisplayTrees(assetNodes), keyIndexMap)
-	return rootTree
+	newNodes := make([]model.Node, 0, len(assetNodes))
+	newNodes = constructDisplayTree(rootTree, convertToDisplayTrees(assetNodes), newNodes)
+	return rootTree, newNodes
 }
 
-func constructDisplayTree(tree treeprint.Tree, rootNodes []*displayTree, keyMap map[string]int) {
+func constructDisplayTree(tree treeprint.Tree, rootNodes []*displayTree, newNodes []model.Node) []model.Node {
 	for i := 0; i < len(rootNodes); i++ {
 		subTree := tree.AddBranch(fmt.Sprintf("%d.%s(%s)",
-			keyMap[rootNodes[i].Key]+1, rootNodes[i].node.Name,
+			len(newNodes)+1, rootNodes[i].node.Name,
 			strconv.Itoa(rootNodes[i].node.AssetsAmount)))
+		newNodes = append(newNodes, rootNodes[i].node)
 		if len(rootNodes[i].subTrees) > 0 {
 			sort.Sort(nodeTrees(rootNodes[i].subTrees))
-			constructDisplayTree(subTree, rootNodes[i].subTrees, keyMap)
+			newNodes = constructDisplayTree(subTree, rootNodes[i].subTrees, newNodes)
 		}
 	}
+	return newNodes
 }
 
 func convertToDisplayTrees(assetNodes []model.Node) []*displayTree {

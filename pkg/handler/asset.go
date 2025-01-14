@@ -1,20 +1,23 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
-	"sort"
+	"io"
 	"strconv"
 	"strings"
 
-	"github.com/jumpserver/koko/pkg/common"
 	"github.com/jumpserver/koko/pkg/i18n"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
+	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/jumpserver/koko/pkg/proxy"
+	"github.com/jumpserver/koko/pkg/srvconn"
 	"github.com/jumpserver/koko/pkg/utils"
+	"golang.org/x/term"
 )
 
-func (u *UserSelectHandler) retrieveRemoteAsset(reqParam model.PaginationParam) []map[string]interface{} {
+func (u *UserSelectHandler) retrieveRemoteAsset(reqParam model.PaginationParam) []model.PermAsset {
 	res, err := u.h.jmsService.GetUserPermsAssets(u.user.ID, reqParam)
 	if err != nil {
 		logger.Errorf("Get user perm assets failed: %s", err.Error())
@@ -22,229 +25,280 @@ func (u *UserSelectHandler) retrieveRemoteAsset(reqParam model.PaginationParam) 
 	return u.updateRemotePageData(reqParam, res)
 }
 
-func (u *UserSelectHandler) searchLocalAsset(searches ...string) []map[string]interface{} {
-	/*
-	   {
-	       "id": "1ccad81f-76a6-4ee2-a3ac-e652ef3afecb",
-	       "hostname": "127.0.0.1",
-	       "ip": "192.168.1.97",
-	       "protocols": [
-	           "rdp/3389"
-	       ],
-	       "os": null,
-	       "domain": null,
-	       "platform": "Windows",
-	       "comment": "",
-	       "org_id": "",
-	       "is_active": true,
-	       "org_name": "DEFAULT"
-	   },
-	*/
-	fields := map[string]struct{}{
-		"name":     {},
-		"hostname": {},
-		"ip":       {},
-		"platform": {},
-		"org_name": {},
-		"comment":  {},
+func (u *UserSelectHandler) searchLocalAsset(searches ...string) []model.PermAsset {
+	allFields := []string{"name", "address", "platform", "comment"}
+	fields := make(map[string]struct{}, len(allFields))
+	for i := range allFields {
+		if u.isHiddenField(allFields[i]) {
+			continue
+		}
+		fields[allFields[i]] = struct{}{}
 	}
 	return u.searchLocalFromFields(fields, searches...)
 }
 
 func (u *UserSelectHandler) displayAssetResult(searchHeader string) {
-	term := u.h.term
 	lang := i18n.NewLang(u.h.i18nLang)
 	if len(u.currentResult) == 0 {
 		noAssets := lang.T("No Assets")
-		utils.IgnoreErrWriteString(term, utils.WrapperString(noAssets, utils.Red))
-		utils.IgnoreErrWriteString(term, utils.CharNewLine)
-		utils.IgnoreErrWriteString(term, utils.WrapperString(searchHeader, utils.Green))
-		utils.IgnoreErrWriteString(term, utils.CharNewLine)
+		u.displayNoResultMsg(searchHeader, noAssets)
 		return
 	}
-	u.displaySortedAssets(searchHeader)
+	u.displayAssets(searchHeader)
 }
 
-func (u *UserSelectHandler) displaySortedAssets(searchHeader string) {
-	lang := i18n.NewLang(u.h.i18nLang)
-	assetListSortBy := u.h.terminalConf.AssetListSortBy
-	switch assetListSortBy {
-	case "ip":
-		sortedAsset := IPAssetList(u.currentResult)
-		sort.Sort(sortedAsset)
-		u.currentResult = sortedAsset
-	default:
-		sortedAsset := HostnameAssetList(u.currentResult)
-		sort.Sort(sortedAsset)
-		u.currentResult = sortedAsset
-	}
-	term := u.h.term
-	currentPage := u.CurrentPage()
-	pageSize := u.PageSize()
-	totalPage := u.TotalPage()
-	totalCount := u.TotalCount()
+const maxFieldSize = 80 // 仅仅是限制字段显示长度最大为 80
 
+func (u *UserSelectHandler) displayAssets(searchHeader string) {
+	currentResult := u.currentResult
+	lang := i18n.NewLang(u.h.i18nLang)
 	idLabel := lang.T("ID")
-	hostLabel := lang.T("Hostname")
-	ipLabel := lang.T("IP")
+	nameLabel := lang.T("Name")
+	addressLabel := lang.T("Address")
 	platformLabel := lang.T("Platform")
 	orgLabel := lang.T("Organization")
 	commentLabel := lang.T("Comment")
-
-	Labels := []string{idLabel, hostLabel, ipLabel, platformLabel, orgLabel, commentLabel}
-	fields := []string{"ID", "Hostname", "IP", "Platform", "Organization", "Comment"}
-	data := make([]map[string]string, len(u.currentResult))
-	for i, j := range u.currentResult {
+	idFieldSize := len(idLabel)
+	nameFieldSize := len(nameLabel)
+	addressFieldSize := len(addressLabel)
+	platformFieldSize := len(platformLabel)
+	organizationFieldSize := len(orgLabel)
+	commentFieldSize := len(commentLabel)
+	data := make([]map[string]string, len(currentResult))
+	for i := range currentResult {
+		item := &u.currentResult[i]
 		row := make(map[string]string)
-		row["ID"] = strconv.Itoa(i + 1)
-		fieldMap := map[string]string{
-			"hostname": "Hostname",
-			"ip":       "IP",
-			"platform": "Platform",
-			"org_name": "Organization",
-			"comment":  "Comment",
-		}
-		row = convertMapItemToRow(j, fieldMap, row)
-		row["Comment"] = joinMultiLineString(row["Comment"])
+		idNumber := strconv.Itoa(i + 1)
+		row["ID"] = idNumber
+		row["Name"] = strings.ReplaceAll(item.Name, " ", "_") // 多个空格可能会导致换行，所以全部替换成下划线
+		row["Address"] = item.Address
+		row["Platform"] = item.Platform.Name
+		row["Organization"] = item.OrgName
+		row["Comment"] = joinMultiLineString(item.Comment)
 		data[i] = row
+		if idFieldSize < len(idNumber) {
+			idFieldSize = len(idNumber)
+		}
+		if len(item.Name) > nameFieldSize {
+			nameFieldSize = len(item.Name)
+		}
+		if len(item.Address) > addressFieldSize {
+			addressFieldSize = len(item.Address)
+		}
 	}
-	w, _ := term.GetSize()
-	caption := fmt.Sprintf(lang.T("Page: %d, Count: %d, Total Page: %d, Total Count: %d"),
-		currentPage, pageSize, totalPage, totalCount)
-
-	caption = utils.WrapperString(caption, utils.Green)
-	table := common.WrapperTable{
-		Fields: fields,
-		Labels: Labels,
-		FieldsSize: map[string][3]int{
-			"ID":           {0, 0, 5},
-			"Hostname":     {0, 40, 0},
-			"IP":           {0, 8, 40},
-			"Platform":     {0, 8, 0},
-			"Organization": {0, 8, 0},
-			"Comment":      {0, 0, 0},
-		},
-		Data:        data,
-		TotalSize:   w,
-		Caption:     caption,
-		TruncPolicy: common.TruncMiddle,
+	if nameFieldSize > maxFieldSize {
+		nameFieldSize = maxFieldSize
 	}
-	table.Initial()
-	loginTip := lang.T("Enter ID number directly login the asset, multiple search use // + field, such as: //16")
-	pageActionTip := lang.T("Page up: b	Page down: n")
-	actionTip := fmt.Sprintf("%s %s", loginTip, pageActionTip)
+	if addressFieldSize > maxFieldSize {
+		addressFieldSize = maxFieldSize
+	}
 
-	_, _ = term.Write([]byte(utils.CharClear))
-	_, _ = term.Write([]byte(table.Display()))
-	utils.IgnoreErrWriteString(term, utils.WrapperString(actionTip, utils.Green))
-	utils.IgnoreErrWriteString(term, utils.CharNewLine)
-	utils.IgnoreErrWriteString(term, utils.WrapperString(searchHeader, utils.Green))
-	utils.IgnoreErrWriteString(term, utils.CharNewLine)
+	allFieldsSize := map[string][3]int{
+		"ID":           {idFieldSize, 0, 0},
+		"Name":         {nameFieldSize, 0, 0},
+		"Address":      {addressFieldSize, 0, 0},
+		"Platform":     {0, platformFieldSize, 0},
+		"Organization": {0, organizationFieldSize, 0},
+		"Comment":      {0, commentFieldSize, 0},
+	}
+	allLabels := []string{idLabel, nameLabel, addressLabel, platformLabel, orgLabel, commentLabel}
+	allFields := []string{"ID", "Name", "Address", "Platform", "Organization", "Comment"}
+	labels := make([]string, 0, len(allLabels))
+	fields := make([]string, 0, len(allFields))
+	for i := range allFields {
+		if u.isHiddenField(allFields[i]) {
+			continue
+		}
+		labels = append(labels, allLabels[i])
+		fields = append(fields, allFields[i])
+	}
+	fieldsSize := make(map[string][3]int, len(fields))
+	for i := range fields {
+		fieldsSize[fields[i]] = allFieldsSize[fields[i]]
+	}
+	u.displayResult(searchHeader, labels, fields, fieldsSize, data)
 }
 
-func (u *UserSelectHandler) proxyAsset(asset model.Asset) {
-	systemUsers, err := u.h.jmsService.GetSystemUsersByUserIdAndAssetId(u.user.ID, asset.ID)
+func GetInputUsername(sess io.ReadWriteCloser) (username string, err error) {
+	vt := term.NewTerminal(sess, "username: ")
+	count := 0
+	for count < 3 {
+		username, err = vt.ReadLine()
+		if err != nil {
+			return "", err
+		}
+		username = strings.TrimSpace(username)
+		if username != "" {
+			return username, nil
+		}
+		count++
+	}
+	return "", errors.New("input username exceed max retry")
+}
+
+func (u *UserSelectHandler) proxyAsset(asset model.PermAsset) {
+	u.selectedAsset = &asset
+	permAssetDetail, err := u.h.jmsService.GetUserPermAssetDetailById(u.user.ID, asset.ID)
 	if err != nil {
+		logger.Errorf("Get asset accounts err: %s", err)
 		return
 	}
-	highestSystemUsers := selectHighestPrioritySystemUsers(systemUsers)
-	selectedSystemUser, ok := u.h.chooseSystemUser(highestSystemUsers)
-
+	// 过滤仅支持的连接协议
+	allSupportedProtocols := srvconn.SupportedProtocols()
+	filterFunc := func(p string) bool {
+		name := strings.ToLower(p)
+		for i := range allSupportedProtocols {
+			if strings.EqualFold(name, allSupportedProtocols[i]) {
+				return true
+			}
+		}
+		return false
+	}
+	protocols := make([]string, 0, len(permAssetDetail.PermedProtocols))
+	for i := range permAssetDetail.PermedProtocols {
+		if filterFunc(permAssetDetail.PermedProtocols[i].Name) {
+			protocols = append(protocols, permAssetDetail.PermedProtocols[i].Name)
+		}
+	}
+	protocol, ok := u.h.chooseAssetProtocol(protocols)
 	if !ok {
+		logger.Info("Not select protocol")
 		return
 	}
 	i18nLang := u.h.i18nLang
-	srv, err := proxy.NewServer(u.h.sess,
-		u.h.jmsService,
-		proxy.ConnectProtocolType(selectedSystemUser.Protocol),
-		proxy.ConnectI18nLang(i18nLang),
-		proxy.ConnectUser(u.h.user),
-		proxy.ConnectAsset(&asset),
-		proxy.ConnectSystemUser(&selectedSystemUser),
-	)
+	lang := i18n.NewLang(i18nLang)
+	if err2 := srvconn.IsSupportedProtocol(protocol); err2 != nil {
+		var errMsg string
+		switch {
+		case errors.As(err2, &srvconn.ErrNoClient{}):
+			errMsg = lang.T("%s protocol client not installed.")
+			errMsg = fmt.Sprintf(errMsg, protocol)
+		default:
+			errMsg = lang.T("Terminal does not support protocol %s, please use web terminal to access")
+			errMsg = fmt.Sprintf(errMsg, protocol)
+		}
+		utils.IgnoreErrWriteString(u.h.term, utils.WrapperWarn(errMsg))
+		return
+	}
+	supportAccounts := u.filterValidAccount(permAssetDetail.PermedAccounts)
+	selectedAccount, ok := u.h.chooseAccount(supportAccounts)
+	if !ok {
+		logger.Info("Not select account")
+		return
+	}
+	u.selectedAccount = &selectedAccount
+	req := service.SuperConnectTokenReq{
+		UserId:        u.user.ID,
+		AssetId:       asset.ID,
+		Account:       selectedAccount.Alias,
+		Protocol:      protocol,
+		ConnectMethod: "ssh",
+		RemoteAddr:    u.h.sess.RemoteAddr(),
+	}
+	if selectedAccount.IsInputUser() {
+		inputUsername, err1 := GetInputUsername(u.h.sess)
+		if err1 != nil {
+			logger.Errorf("Get input username err: %s", err1)
+			return
+		}
+		req.InputUsername = inputUsername
+	}
+
+	tokenInfo, err := u.h.jmsService.CreateSuperConnectToken(&req)
 	if err != nil {
-		logger.Error(err)
+		if tokenInfo.Code == "" {
+			logger.Errorf("Create connect token and auth info failed: %s", err)
+			utils.IgnoreErrWriteString(u.h.term, lang.T("Core API failed"))
+			return
+		}
+		switch tokenInfo.Code {
+		case model.ACLReject:
+			logger.Errorf("Create connect token and auth info failed: %s", tokenInfo.Detail)
+			utils.IgnoreErrWriteString(u.h.term, lang.T("ACL reject"))
+			utils.IgnoreErrWriteString(u.h.term, utils.CharNewLine)
+			return
+		case model.ACLFaceVerify, model.ACLFaceOnline, model.ACLFaceOnlineNotSupported:
+			// todo: 需要人脸验证 后续需要发站内信通知用户，并且等待用户人脸验证通过
+			logger.Errorf("Create connect token and auth info failed: %s %s", tokenInfo.Code, tokenInfo.Detail)
+			msg := lang.T("Face ACL is not supported yet. Please use the WebTerminal to connect the asset.")
+			utils.IgnoreErrWriteString(u.h.term, msg)
+			utils.IgnoreErrWriteString(u.h.term, utils.CharNewLine)
+			return
+		case model.ACLReview:
+			reviewHandler := LoginReviewHandler{
+				readWriter: u.h.sess,
+				i18nLang:   u.h.i18nLang,
+				user:       u.user,
+				jmsService: u.h.jmsService,
+				req:        &req,
+			}
+			ok2, err2 := reviewHandler.WaitReview(u.h.sess.Context())
+			if err2 != nil {
+				logger.Errorf("Wait login review failed: %s", err)
+				utils.IgnoreErrWriteString(u.h.term, lang.T("Core API failed"))
+				return
+			}
+			if !ok2 {
+				logger.Error("Wait login review failed")
+				return
+			}
+			tokenInfo = reviewHandler.tokenInfo
+		default:
+			msg := lang.T("Unknown error code: %s, detail: %s")
+			utils.IgnoreErrWriteString(u.h.term, fmt.Sprintf(msg, tokenInfo.Code, tokenInfo.Detail))
+			utils.IgnoreErrWriteString(u.h.term, utils.CharNewLine)
+			logger.Errorf("Create connect token and auth info failed: %s %s", tokenInfo.Code, tokenInfo.Detail)
+			return
+		}
+	}
+
+	connectToken, err := u.h.jmsService.GetConnectTokenInfo(tokenInfo.ID)
+	if err != nil {
+		logger.Errorf("connect token err: %s", err)
+		utils.IgnoreErrWriteString(u.h.term, lang.T("get connect token err"))
+		return
+	}
+	proxyOpts := make([]proxy.ConnectionOption, 0, 10)
+	proxyOpts = append(proxyOpts, proxy.ConnectTokenAuthInfo(&connectToken))
+	proxyOpts = append(proxyOpts, proxy.ConnectI18nLang(i18nLang))
+	srv, err := proxy.NewServer(u.h.sess, u.h.jmsService, proxyOpts...)
+	if err != nil {
+		logger.Errorf("create proxy server err: %s", err)
 		return
 	}
 	srv.Proxy()
-	logger.Infof("Request %s: asset %s proxy end", u.h.sess.Uuid, asset.Hostname)
-
 }
 
-var (
-	_ sort.Interface = (HostnameAssetList)(nil)
-	_ sort.Interface = (IPAssetList)(nil)
-)
-
-type HostnameAssetList []map[string]interface{}
-
-func (l HostnameAssetList) Len() int {
-	return len(l)
-}
-
-func (l HostnameAssetList) Less(i, j int) bool {
-	iHostnameValue := l[i]["hostname"]
-	jHostnameValue := l[j]["hostname"]
-	iHostname, ok := iHostnameValue.(string)
-	if !ok {
+func (u *UserSelectHandler) isHiddenField(field string) bool {
+	fieldName := strings.ToLower(field)
+	if isBuiltinFields(fieldName) {
 		return false
 	}
-	jHostname, ok := jHostnameValue.(string)
-	if !ok {
-		return false
-	}
-	return CompareString(iHostname, jHostname)
+	_, ok := u.hiddenFields[fieldName]
+	return ok
 }
 
-func (l HostnameAssetList) Swap(i, j int) {
-	l[j], l[i] = l[i], l[j]
-}
-
-type IPAssetList []map[string]interface{}
-
-func (l IPAssetList) Len() int {
-	return len(l)
-}
-
-func (l IPAssetList) Less(i, j int) bool {
-	iIPValue := l[i]["ip"]
-	jIPValue := l[j]["ip"]
-	iIP, ok := iIPValue.(string)
-	if !ok {
-		return false
-	}
-	jIP, ok := jIPValue.(string)
-	if !ok {
-		return false
-	}
-	return CompareIP(iIP, jIP)
-}
-
-func (l IPAssetList) Swap(i, j int) {
-	l[j], l[i] = l[i], l[j]
-}
-
-func CompareIP(ipA, ipB string) bool {
-	iIPs := strings.Split(ipA, ".")
-	jIPs := strings.Split(ipB, ".")
-	for i := 0; i < len(iIPs); i++ {
-		if i >= len(jIPs) {
-			return false
+func (u *UserSelectHandler) filterValidAccount(accounts []model.PermAccount) []model.PermAccount {
+	ret := make([]model.PermAccount, 0, len(accounts))
+	for i := range accounts {
+		// 匿名账号不显示
+		if accounts[i].IsAnonymous() {
+			continue
 		}
-		if len(iIPs[i]) == len(jIPs[i]) {
-			if iIPs[i] == jIPs[i] {
-				continue
-			} else {
-				return iIPs[i] < jIPs[i]
-			}
-		} else {
-			return len(iIPs[i]) < len(jIPs[i])
-		}
-
+		ret = append(ret, accounts[i])
 	}
-	return true
+	return ret
 }
 
-func CompareString(a, b string) bool {
-	return a < b
+var builtinFields = map[string]struct{}{
+	"id":      {},
+	"name":    {},
+	"address": {},
+	"comment": {},
+}
+
+func isBuiltinFields(field string) bool {
+	fieldName := strings.ToLower(field)
+	_, ok := builtinFields[fieldName]
+	return ok
 }

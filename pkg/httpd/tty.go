@@ -2,20 +2,17 @@ package httpd
 
 import (
 	"encoding/json"
+	"errors"
+	"github.com/jumpserver/koko/pkg/srvconn"
 	"io"
-	"net/url"
-	"strings"
 	"sync"
 
 	"github.com/gliderlabs/ssh"
-
 	"github.com/jumpserver/koko/pkg/exchange"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/common"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
-	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/jumpserver/koko/pkg/proxy"
-	"github.com/jumpserver/koko/pkg/srvconn"
 )
 
 var _ Handler = (*tty)(nil)
@@ -23,24 +20,14 @@ var _ Handler = (*tty)(nil)
 type tty struct {
 	ws *UserWebsocket
 
-	targetType   string
-	targetId     string
-	systemUserId string
-
-	initialed  bool
-	wg         sync.WaitGroup
-	systemUser *model.SystemUser
-	asset      *model.Asset
-
-	app *model.Application
+	initialed bool
+	wg        sync.WaitGroup
 
 	backendClient *Client
 
-	jmsService *service.JMService
-
 	shareInfo *ShareInfo
 
-	extraParams url.Values
+	K8sClients map[string]*Client
 }
 
 func (h *tty) Name() string {
@@ -51,41 +38,32 @@ func (h *tty) CleanUp() {
 	if h.backendClient != nil {
 		_ = h.backendClient.Close()
 	}
-	h.wg.Wait()
+
+	for id, client := range h.K8sClients {
+		_ = client.Close()
+		delete(h.K8sClients, id)
+	}
 }
 
-func (h *tty) CheckValidation() bool {
-	var ok bool
-	switch h.targetType {
+func (h *tty) CheckValidation() error {
+	var err error
+	params := h.ws.wsParams
+	switch params.TargetType {
 	case TargetTypeMonitor:
-		ok = h.CheckShareRoomReadPerm(h.ws.user.ID, h.targetId)
+		return h.CheckMonitorReadPerm(h.ws.user.ID, params.TargetId)
 	case TargetTypeShare:
-		ok = h.CheckEnableShare()
+		return h.CheckEnableShare()
 	default:
-		if h.systemUserId == "" || h.targetId == "" {
-			logger.Errorf("Ws[%s] miss required query params.", h.ws.Uuid)
-			return false
+		if h.ws.ConnectToken == nil {
+			return errors.New("connect token is nil")
 		}
-		systemUser, err := h.jmsService.GetSystemUserById(h.systemUserId)
-		if err != nil {
-			logger.Errorf("Ws[%s] get system user err: %s", h.ws.Uuid, err)
-			return false
-		}
-		if systemUser.ID == "" {
-			logger.Errorf("Ws[%s] get invalid system user", h.ws.Uuid)
-			return false
-		}
-		h.systemUser = &systemUser
-
-		ok = h.getTargetApp(systemUser.Protocol)
 	}
-	logger.Infof("Ws[%s] check connect type %s: %t", h.ws.Uuid, h.targetType, ok)
-	return ok
+	return err
 }
 
 func (h *tty) HandleMessage(msg *Message) {
 	switch msg.Type {
-	case TERMINALINIT:
+	case TerminalInit:
 		if msg.Id != h.ws.Uuid {
 			logger.Errorf("Ws[%s] terminal initial unknown message id %s", h.ws.Uuid, msg.Id)
 			return
@@ -95,69 +73,29 @@ func (h *tty) HandleMessage(msg *Message) {
 			return
 		}
 
-		var connectInfo TerminalConnectData
-		err := json.Unmarshal([]byte(msg.Data), &connectInfo)
+		connectInfo, err := h.validateAndInitSession(msg)
 		if err != nil {
-			logger.Errorf("Ws[%s] terminal initial message data unmarshal err: %s",
-				h.ws.Uuid, err)
 			return
 		}
-		if h.targetType == TargetTypeShare {
-			code := connectInfo.Code
-			info, err2 := h.ValidateShareParams(h.targetId, code)
-			if err2 != nil {
-				logger.Errorf("Ws[%s] terminal initial validate share err: %s",
-					h.ws.Uuid, err2)
-				h.sendCloseMessage()
-				return
-			}
-			h.shareInfo = &info
-			sessionDetail, err3 := h.jmsService.GetSessionById(info.Record.SessionId)
-			if err3 != nil {
-				logger.Errorf("Ws[%s] terminal get session %s err: %s",
-					h.ws.Uuid, info.Record.SessionId, err3)
-				h.sendCloseMessage()
-				return
-			}
-			// 获取权限校验
-			var expireInfo model.ExpireInfo
-			switch sessionDetail.Protocol {
-			case srvconn.ProtocolTELNET, srvconn.ProtocolSSH:
-				expireInfo, err3 = h.jmsService.ValidateAssetConnectPermission(sessionDetail.UserID, sessionDetail.AssetID,
-					sessionDetail.SystemUserID)
-			default:
-				expireInfo, err3 = h.jmsService.ValidateApplicationPermission(sessionDetail.UserID, sessionDetail.AssetID,
-					sessionDetail.SystemUserID)
-			}
-			if err3 != nil {
-				logger.Errorf("获取会话的权限失败：%s", err3)
-				h.sendCloseMessage()
-				return
-			}
-			perms := model.Permission{Actions: expireInfo.Actions}
-			sessionInfo := proxy.SessionInfo{
-				Session: &sessionDetail,
-				Perms:   &perms,
-			}
-			data, _ := json.Marshal(sessionInfo)
-			h.sendSessionMessage(string(data))
-		}
+
 		h.initialed = true
-		win := ssh.Window{
-			Width:  connectInfo.Cols,
-			Height: connectInfo.Rows,
+		h.handleTerminalInit(connectInfo, "", "", "", "")
+
+	case TerminalK8SInit:
+		if msg.Id != h.ws.Uuid {
+			logger.Errorf("Ws[%s] terminal initial unknown message id %s", h.ws.Uuid, msg.Id)
+			return
 		}
-		userR, userW := io.Pipe()
-		h.backendClient = &Client{
-			WinChan: make(chan ssh.Window, 100), Conn: h.ws,
-			UserRead: userR, UserWrite: userW,
-			pty: ssh.Pty{Term: "xterm", Window: win},
+
+		connectInfo, err := h.validateAndInitSession(msg)
+		if err != nil {
+			return
 		}
-		h.wg.Add(1)
-		go h.proxy(&h.wg)
-		return
+
+		h.handleTerminalInit(connectInfo, msg.KubernetesId, msg.Namespace, msg.Pod, msg.Container)
 	}
-	if h.initialed {
+
+	if h.initialed || func() bool { _, ok := h.K8sClients[msg.KubernetesId]; return ok }() {
 		h.handleTerminalMessage(msg)
 	}
 }
@@ -170,34 +108,99 @@ func (h *tty) sendCloseMessage() {
 	h.ws.SendMessage(&closedMsg)
 }
 
-func (h *tty) sendSessionMessage(data string) {
+func (h *tty) sendK8SCloseMessage(KubernetesId string) {
+	closedMsg := Message{
+		Id:           h.ws.Uuid,
+		Type:         K8SClose,
+		KubernetesId: KubernetesId,
+	}
+	h.ws.SendMessage(&closedMsg)
+}
+
+func (h *tty) sendSessionMessage(data string, KubernetesId string) {
 	msg := Message{
-		Id:   h.ws.Uuid,
-		Type: TERMINALSESSION,
-		Data: data,
+		Id:           h.ws.Uuid,
+		Type:         TerminalSession,
+		Data:         data,
+		KubernetesId: KubernetesId,
 	}
 	h.ws.SendMessage(&msg)
 }
 
+func (h *tty) validateAndInitSession(msg *Message) (TerminalConnectData, error) {
+	var connectInfo TerminalConnectData
+	err := json.Unmarshal([]byte(msg.Data), &connectInfo)
+	if err != nil {
+		logger.Errorf("Ws[%s] terminal initial message data unmarshal err: %s",
+			h.ws.Uuid, err)
+		return connectInfo, err
+	}
+
+	params := h.ws.wsParams
+
+	if params.TargetType == TargetTypeShare {
+		code := connectInfo.Code
+		info, err2 := h.ValidateShareParams(params.TargetId, code)
+		if err2 != nil {
+			logger.Errorf("Ws[%s] terminal initial validate share err: %s",
+				h.ws.Uuid, err2)
+			h.sendCloseMessage()
+			return connectInfo, err2
+		}
+		h.shareInfo = &info
+		sessionDetail, err3 := h.ws.apiClient.GetSessionById(info.Record.Session.ID)
+		if err3 != nil {
+			logger.Errorf("Ws[%s] terminal get session %s err: %s",
+				h.ws.Uuid, info.Record.Session.ID, err3)
+			h.sendCloseMessage()
+			return connectInfo, err3
+		}
+		sessionInfo := proxy.SessionInfo{
+			Session: &sessionDetail,
+		}
+		data, _ := json.Marshal(sessionInfo)
+		h.sendSessionMessage(string(data), msg.KubernetesId)
+	}
+	return connectInfo, nil
+}
+
+func (h *tty) handleTerminalInit(connectInfo TerminalConnectData, KubernetesId, namespace, pod, container string) {
+	win := ssh.Window{
+		Width:  connectInfo.Cols,
+		Height: connectInfo.Rows,
+	}
+	userR, userW := io.Pipe()
+	client := &Client{
+		WinChan: make(chan ssh.Window, 100), Conn: h.ws,
+		UserRead: userR, UserWrite: userW,
+		pty:          ssh.Pty{Term: "xterm", Window: win},
+		KubernetesId: KubernetesId, Namespace: namespace,
+		Pod: pod, Container: container,
+	}
+
+	if KubernetesId != "" {
+		if h.K8sClients == nil {
+			h.K8sClients = make(map[string]*Client)
+		}
+		h.K8sClients[KubernetesId] = client
+	} else {
+		h.backendClient = client
+	}
+
+	h.wg.Add(1)
+	go h.proxy(&h.wg, client)
+}
+
 func (h *tty) handleTerminalMessage(msg *Message) {
 	switch msg.Type {
-	case TERMINALDATA:
-		h.backendClient.WriteData([]byte(msg.Data))
-	case TERMINALBINARY:
-		h.backendClient.WriteData(msg.Raw)
-	case TERMINALRESIZE:
-		var size WindowSize
-		err := json.Unmarshal([]byte(msg.Data), &size)
-		if err != nil {
-			logger.Errorf("Ws[%s] message(%s) data unmarshal err: %s", h.ws.Uuid,
-				msg.Type, msg.Data)
-			return
-		}
-		h.backendClient.SetWinSize(ssh.Window{
-			Width:  size.Cols,
-			Height: size.Rows,
-		})
-	case TERMINALSHARE:
+	case TerminalData, TerminalBinary:
+		data := getDataBytes(msg)
+		h.backendClient.WriteData(data)
+	case TerminalResize, TerminalK8SResize:
+		h.handleResize(msg)
+	case TerminalK8SData, TerminalK8SBinary:
+		h.handleK8SMessage(msg)
+	case TerminalShare:
 		var shareData ShareRequestParams
 
 		err := json.Unmarshal([]byte(msg.Data), &shareData)
@@ -207,9 +210,9 @@ func (h *tty) handleTerminalMessage(msg *Message) {
 			return
 		}
 		logger.Debugf("Ws[%s] receive share request %s", h.ws.Uuid, msg.Data)
-		go h.createShareSession(shareData)
+		go h.createShareSession(&shareData)
 		return
-	case TERMINALGETSHAREUSERS:
+	case TerminalGetShareUser:
 		var query GetUserParams
 		err := json.Unmarshal([]byte(msg.Data), &query)
 		if err != nil {
@@ -220,16 +223,124 @@ func (h *tty) handleTerminalMessage(msg *Message) {
 		logger.Debugf("Ws[%s] receive share request %s", h.ws.Uuid, msg.Data)
 		go h.getShareUserInfo(query)
 		return
-
+	case TerminalShareUserRemove:
+		var query RemoveSharingUserParams
+		err := json.Unmarshal([]byte(msg.Data), &query)
+		if err != nil {
+			logger.Errorf("Ws[%s] message(%s) data unmarshal err: %s", h.ws.Uuid,
+				msg.Type, msg.Data)
+			return
+		}
+		logger.Debugf("Ws[%s] receive share remove user request %s", h.ws.Uuid, msg.Data)
+		go h.removeShareUser(&query)
+		return
+	case TerminalSyncUserPreference:
+		var preference UserKoKoPreferenceParam
+		err := json.Unmarshal([]byte(msg.Data), &preference)
+		if err != nil {
+			logger.Errorf("Ws[%s] message(%s) data unmarshal err: %s", h.ws.Uuid,
+				msg.Type, msg.Data)
+			return
+		}
+		logger.Debugf("Ws[%s] receive sync user preference request %s", h.ws.Uuid, msg.Data)
+		go h.syncUserPreference(&preference)
+		return
 	case CLOSE:
 		_ = h.backendClient.Close()
+	case K8SClose:
+		if k8sClient, ok := h.K8sClients[msg.KubernetesId]; ok {
+			_ = k8sClient.Close()
+			delete(h.K8sClients, msg.KubernetesId)
+		}
 	default:
 		logger.Infof("Ws[%s] handle unknown message(%s) data %s", h.ws.Uuid,
 			msg.Type, msg.Data)
 	}
 }
 
-func (h *tty) createShareSession(shareData ShareRequestParams) {
+func getDataBytes(msg *Message) []byte {
+	if msg.Type == TerminalData || msg.Type == TerminalK8SData {
+		return []byte(msg.Data)
+	}
+	return msg.Raw
+}
+
+func (h *tty) handleK8SMessage(msg *Message) {
+	if k8sClient, ok := h.K8sClients[msg.KubernetesId]; ok {
+		k8sClient.WriteData(getDataBytes(msg))
+	}
+}
+
+func (h *tty) handleResize(msg *Message) {
+	var size WindowSize
+	err := json.Unmarshal([]byte(msg.Data), &size)
+	if err != nil {
+		logger.Errorf("Ws[%s] message(%s) data unmarshal err: %s", h.ws.Uuid, msg.Type, msg.Data)
+		return
+	}
+	if msg.Type == TerminalResize {
+		h.backendClient.SetWinSize(ssh.Window{
+			Width:  size.Cols,
+			Height: size.Rows,
+		})
+	} else if msg.Type == TerminalK8SResize {
+		if k8sClient, ok := h.K8sClients[msg.KubernetesId]; ok {
+			k8sClient.SetWinSize(ssh.Window{Width: size.Cols, Height: size.Rows})
+		}
+	}
+}
+
+func (h *tty) removeShareUser(query *RemoveSharingUserParams) {
+	if room := exchange.GetRoom(query.SessionId); room != nil {
+		var data = make(map[string]interface{})
+		data["primary_user"] = h.ws.user.String()
+		data["share_user"] = query.UserMeta.User
+		data["terminal_id"] = query.UserMeta.TerminalId
+		body, _ := json.Marshal(data)
+		room.Broadcast(&exchange.RoomMessage{
+			Event: exchange.ShareRemoveUser,
+			Body:  body,
+			Meta:  query.UserMeta,
+		})
+	}
+}
+
+func (h *tty) syncUserPreference(preference *UserKoKoPreferenceParam) {
+	/*
+		{"basic":{"file_name_conflict_resolution":"replace","terminal_theme_name":"Flat"}}
+	*/
+	reqCookies := h.ws.ctx.Request.Cookies()
+	var cookies = make(map[string]string)
+	for _, cookie := range reqCookies {
+		cookies[cookie.Name] = cookie.Value
+	}
+	data := model.UserKokoPreference{
+		Basic: model.KokoBasic{
+			ThemeName: preference.ThemeName,
+		},
+	}
+	var msg struct {
+		EventName string `json:"event_name"`
+	}
+	msg.EventName = "sync_user_preference"
+	errMsg := ""
+	err := h.ws.apiClient.SyncUserKokoPreference(cookies, data)
+	if err != nil {
+		logger.Errorf("Ws[%s] sync user preference err: %s", h.ws.Uuid, err)
+		errMsg = err.Error()
+	}
+	msgNotify, _ := json.Marshal(msg)
+
+	h.ws.SendMessage(&Message{
+		Id:   h.ws.Uuid,
+		Type: MessageNotify,
+		Data: string(msgNotify),
+		Err:  errMsg,
+	})
+
+}
+
+func (h *tty) createShareSession(shareData *ShareRequestParams) {
 	// 创建 共享连接
 	res, err := h.handleShareRequest(shareData)
 	if err != nil {
@@ -238,13 +349,13 @@ func (h *tty) createShareSession(shareData ShareRequestParams) {
 	data, _ := json.Marshal(res)
 	h.ws.SendMessage(&Message{
 		Id:   h.ws.Uuid,
-		Type: TERMINALSHARE,
+		Type: TerminalShare,
 		Data: string(data),
 	})
 }
 
 func (h *tty) getShareUserInfo(query GetUserParams) {
-	shareUserResp, err := h.jmsService.GetShareUserInfo(query.Query)
+	shareUserResp, err := h.ws.apiClient.GetShareUserInfo(query.Query)
 	if err != nil {
 		logger.Error(err)
 		return
@@ -252,13 +363,13 @@ func (h *tty) getShareUserInfo(query GetUserParams) {
 	data, _ := json.Marshal(shareUserResp)
 	h.ws.SendMessage(&Message{
 		Id:   h.ws.Uuid,
-		Type: TERMINALGETSHAREUSERS,
+		Type: TerminalGetShareUser,
 		Data: string(data),
 	})
 }
 
-func (h *tty) handleShareRequest(data ShareRequestParams) (res ShareResponse, err error) {
-	shareResp, err := h.jmsService.CreateShareRoom(data.SessionID, data.ExpireTime, data.Users)
+func (h *tty) handleShareRequest(data *ShareRequestParams) (res ShareResponse, err error) {
+	shareResp, err := h.ws.apiClient.CreateShareRoom(data.SharingSessionRequest)
 	if err != nil {
 		logger.Error(err)
 		return res, err
@@ -269,14 +380,14 @@ func (h *tty) handleShareRequest(data ShareRequestParams) (res ShareResponse, er
 }
 
 func (h *tty) ValidateShareParams(shareId, code string) (info ShareInfo, err error) {
-	data := service.SharePostData{
+	data := model.SharePostData{
 		ShareId:    shareId,
 		Code:       code,
 		UserId:     h.ws.user.ID,
 		RemoteAddr: h.ws.ClientIP(),
 	}
 
-	recordRes, err := h.jmsService.JoinShareRoom(data)
+	recordRes, err := h.ws.apiClient.JoinShareRoom(data)
 	if err != nil {
 		logger.Errorf("Conn[%s] Validate Share err: %s", h.ws.Uuid, err)
 		var errMsg string
@@ -289,47 +400,18 @@ func (h *tty) ValidateShareParams(shareId, code string) (info ShareInfo, err err
 		}
 		h.ws.SendMessage(&Message{
 			Id:   h.ws.Uuid,
-			Type: TERMINALERROR,
-			Data: errMsg,
+			Type: TerminalError,
+			Err:  errMsg,
 		})
 		return
 	}
 	return ShareInfo{recordRes}, nil
 }
 
-func (h *tty) getTargetApp(protocol string) bool {
-	switch strings.ToLower(protocol) {
-	case srvconn.ProtocolMySQL, srvconn.ProtocolMariadb,
-		srvconn.ProtocolK8s, srvconn.ProtocolSQLServer,
-		srvconn.ProtocolRedis, srvconn.ProtocolMongoDB,
-		srvconn.ProtocolPostgreSQL, srvconn.ProtocolClickHouse:
-		appAsset, err := h.jmsService.GetApplicationById(h.targetId)
-		if err != nil {
-			logger.Errorf("Get %s application failed; %s", protocol, err)
-			return false
-		}
-		if appAsset.ID != "" {
-			h.app = &appAsset
-			return true
-		}
-	default:
-		asset, err := h.jmsService.GetAssetById(h.targetId)
-		if err != nil {
-			logger.Errorf("Get asset failed; %s", err)
-			return false
-		}
-		if asset.ID != "" {
-			h.asset = &asset
-			return true
-		}
-	}
-	return false
-}
-
-func (h *tty) getk8sContainerInfo() *proxy.ContainerInfo {
-	pod := h.extraParams.Get("pod")
-	namespace := h.extraParams.Get("namespace")
-	container := h.extraParams.Get("container")
+func (h *tty) getK8sContainerInfo(client *Client) *proxy.ContainerInfo {
+	pod := client.Pod
+	namespace := client.Namespace
+	container := client.Container
 	if pod == "" || namespace == "" || container == "" {
 		return nil
 	}
@@ -342,7 +424,8 @@ func (h *tty) getk8sContainerInfo() *proxy.ContainerInfo {
 }
 
 func (h *tty) getConnectionParams() *proxy.ConnectionParams {
-	disableAutoHash := h.extraParams.Get("disableautohash")
+	wsParams := h.ws.wsParams
+	disableAutoHash := wsParams.DisableAutoHash
 	if disableAutoHash == "" {
 		return nil
 	}
@@ -352,40 +435,23 @@ func (h *tty) getConnectionParams() *proxy.ConnectionParams {
 	return &params
 }
 
-func (h *tty) proxy(wg *sync.WaitGroup) {
+func (h *tty) proxy(wg *sync.WaitGroup, client *Client) {
 	defer wg.Done()
-	switch h.targetType {
+	params := h.ws.wsParams
+	switch params.TargetType {
 	case TargetTypeMonitor:
-		h.Monitor(h.backendClient, h.targetId)
+		h.Monitor(h.backendClient, params.TargetId)
 	case TargetTypeShare:
-		roomID := h.shareInfo.Record.SessionId
+		roomID := h.shareInfo.Record.Session.ID
 		h.JoinRoom(h.backendClient, roomID)
 	default:
-		proxyOpts := make([]proxy.ConnectionOption, 0, 4)
-		proxyOpts = append(proxyOpts, proxy.ConnectProtocolType(h.systemUser.Protocol))
-		proxyOpts = append(proxyOpts, proxy.ConnectSystemUser(h.systemUser))
-		proxyOpts = append(proxyOpts, proxy.ConnectUser(h.ws.user))
-		if langCode, err := h.ws.ctx.Cookie("django_language"); err == nil {
-			proxyOpts = append(proxyOpts, proxy.ConnectI18nLang(langCode))
-		}
-		if params := h.getConnectionParams(); params != nil {
-			proxyOpts = append(proxyOpts, proxy.ConnectParams(params))
-		}
-		switch h.systemUser.Protocol {
-		case srvconn.ProtocolMySQL, srvconn.ProtocolMariadb,
-			srvconn.ProtocolSQLServer, srvconn.ProtocolPostgreSQL,
-			srvconn.ProtocolClickHouse,
-			srvconn.ProtocolRedis, srvconn.ProtocolMongoDB:
-			proxyOpts = append(proxyOpts, proxy.ConnectApp(h.app))
-		case srvconn.ProtocolK8s:
-			proxyOpts = append(proxyOpts, proxy.ConnectApp(h.app))
-			if info := h.getk8sContainerInfo(); info != nil {
-				proxyOpts = append(proxyOpts, proxy.ConnectContainer(info))
-			}
-		default:
-			proxyOpts = append(proxyOpts, proxy.ConnectAsset(h.asset))
-		}
-		srv, err := proxy.NewServer(h.backendClient, h.jmsService, proxyOpts...)
+		connectToken := h.ws.ConnectToken
+		proxyOpts := make([]proxy.ConnectionOption, 0, 10)
+		proxyOpts = append(proxyOpts, proxy.ConnectTokenAuthInfo(connectToken))
+		proxyOpts = append(proxyOpts, proxy.ConnectI18nLang(h.ws.langCode))
+		proxyOpts = append(proxyOpts, proxy.ConnectParams(h.getConnectionParams()))
+		proxyOpts = append(proxyOpts, proxy.ConnectContainer(h.getK8sContainerInfo(client)))
+		srv, err := proxy.NewServer(client, h.ws.apiClient, proxyOpts...)
 		if err != nil {
 			logger.Errorf("Create proxy server failed: %s", err)
 			h.sendCloseMessage()
@@ -393,32 +459,42 @@ func (h *tty) proxy(wg *sync.WaitGroup) {
 		}
 		srv.OnSessionInfo = func(info *proxy.SessionInfo) {
 			data, _ := json.Marshal(info)
-			h.sendSessionMessage(string(data))
+			h.sendSessionMessage(string(data), client.KubernetesId)
 		}
 		srv.Proxy()
+	}
+
+	if params.TargetType == srvconn.ProtocolK8s {
+		delete(h.K8sClients, client.KubernetesId)
+		h.sendK8SCloseMessage(client.KubernetesId)
+		return
 	}
 	h.sendCloseMessage()
 	logger.Info("Ws tty proxy end")
 }
 
-func (h *tty) CheckShareRoomReadPerm(uerId, roomId string) bool {
-	ret, err := h.jmsService.ValidateJoinSessionPermission(uerId, roomId)
+func (h *tty) CheckMonitorReadPerm(uerId, roomId string) error {
+	ret, err := h.ws.apiClient.ValidateJoinSessionPermission(uerId, roomId)
 	if err != nil {
 		logger.Errorf("Create share room %s failed: %s", roomId, err)
-		return false
+		return ErrPermissionDenied
 	}
 	if !ret.Ok {
-		return false
+		return ErrPermissionDenied
 	}
-	return true
+	return nil
 }
 
-func (h *tty) CheckEnableShare() bool {
-	termConf, err := h.jmsService.GetTerminalConfig()
+func (h *tty) CheckEnableShare() error {
+	termConf, err := h.ws.apiClient.GetTerminalConfig()
 	if err != nil {
-		logger.Error(err)
+		logger.Errorf("Get terminal config failed: %s", err)
+		return err
 	}
-	return termConf.EnableSessionShare
+	if !termConf.EnableSessionShare {
+		return ErrDisableShare
+	}
+	return nil
 }
 
 /*
@@ -428,13 +504,16 @@ func (h *tty) CheckEnableShare() bool {
 */
 
 func (h *tty) JoinRoom(c *Client, roomID string) {
-
 	user := h.ws.user
+	writable := h.shareInfo.Record.Writeable()
 	meta := exchange.MetaMessage{
 		UserId:     user.ID,
 		User:       user.String(),
 		Created:    common.NewNowUTCTime().String(),
 		RemoteAddr: c.RemoteAddr(),
+		TerminalId: h.ws.Uuid,
+		Primary:    false,
+		Writable:   writable,
 	}
 	if room := exchange.GetRoom(roomID); room != nil {
 		conn := exchange.WrapperUserCon(c)
@@ -445,10 +524,12 @@ func (h *tty) JoinRoom(c *Client, roomID string) {
 			Body:  nil,
 			Meta:  meta,
 		})
+		logObj := model.SessionLifecycleLog{User: h.ws.user.String()}
+		h.ws.RecordLifecycleLog(roomID, model.UserJoinSession, logObj)
 		for {
 			buf := make([]byte, 1024)
 			nr, err := c.Read(buf)
-			if nr > 0 {
+			if nr > 0 && writable {
 				room.Receive(&exchange.RoomMessage{
 					Event: exchange.DataEvent, Body: buf[:nr],
 					Meta: meta})
@@ -463,8 +544,9 @@ func (h *tty) JoinRoom(c *Client, roomID string) {
 			Body:  nil,
 			Meta:  meta,
 		})
+		h.ws.RecordLifecycleLog(roomID, model.UserLeaveSession, logObj)
 		logger.Infof("Conn[%s] user read end", c.ID())
-		if err := h.jmsService.FinishShareRoom(h.shareInfo.Record.ID); err != nil {
+		if err := h.ws.apiClient.FinishShareRoom(h.shareInfo.Record.ID); err != nil {
 			logger.Infof("Conn[%s] finish share room err: %s", c.ID(), err)
 		}
 	}
@@ -475,6 +557,8 @@ func (h *tty) Monitor(c *Client, roomID string) {
 		conn := exchange.WrapperUserCon(c)
 		room.Subscribe(conn)
 		defer room.UnSubscribe(conn)
+		logObj := model.SessionLifecycleLog{User: h.ws.user.String()}
+		h.ws.RecordLifecycleLog(roomID, model.AdminJoinMonitor, logObj)
 		for {
 			buf := make([]byte, 1024)
 			_, err := c.Read(buf)
@@ -485,5 +569,6 @@ func (h *tty) Monitor(c *Client, roomID string) {
 			logger.Debugf("Conn[%s] user monitor", c.ID())
 		}
 		logger.Infof("Conn[%s] user read end", c.ID())
+		h.ws.RecordLifecycleLog(roomID, model.AdminExitMonitor, logObj)
 	}
 }

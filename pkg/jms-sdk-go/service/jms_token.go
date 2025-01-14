@@ -1,52 +1,54 @@
 package service
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
 )
 
-func (s *JMService) GetTokenAsset(token string) (tokenUser model.TokenUser, err error) {
-	Url := fmt.Sprintf(TokenAssetURL, token)
-	_, err = s.authClient.Get(Url, &tokenUser)
-	return
-}
-
-func (s *JMService) GetConnectTokenAuth(token string) (resp TokenAuthInfoResponse, err error) {
+func (s *JMService) GetConnectTokenInfo(tokenId string) (resp model.ConnectToken, err error) {
 	data := map[string]string{
-		"token": token,
+		"id": tokenId,
 	}
-	_, err = s.authClient.Post(TokenAuthInfoURL, data, &resp)
+	_, err = s.authClient.Post(SuperConnectTokenSecretURL, data, &resp)
 	return
 }
 
-func (s *JMService) RenewalToken(token string) (resp TokenRenewalResponse, err error) {
-	data := map[string]string{
-		"token": token,
+func (s *JMService) CreateSuperConnectToken(data *SuperConnectTokenReq) (resp model.ConnectTokenInfo, err error) {
+	ak := s.opt.accessKey
+	apiClient := s.authClient.Clone()
+	if s.opt.sign != nil {
+		apiClient.SetAuthSign(s.opt.sign)
 	}
-	_, err = s.authClient.Patch(TokenRenewalURL, data, &resp)
+	apiClient.SetHeader(orgHeaderKey, orgHeaderValue)
+	// 移除 Secret 中的 "-", 保证长度为 32
+	secretKey := strings.ReplaceAll(ak.Secret, "-", "")
+	encryptKey, err1 := GenerateEncryptKey(secretKey)
+	if err1 != nil {
+		return resp, err1
+	}
+	signKey := fmt.Sprintf("%s:%s", ak.ID, encryptKey)
+	apiClient.SetHeader(svcHeader, fmt.Sprintf("Sign %s", signKey))
+	_, err = apiClient.Post(SuperConnectTokenInfoURL, data, &resp, data.Params)
 	return
 }
 
-type TokenRenewalResponse struct {
-	Ok  bool   `json:"ok"`
-	Msg string `json:"msg"`
+type SuperConnectTokenReq struct {
+	UserId        string `json:"user"`
+	AssetId       string `json:"asset"`
+	Account       string `json:"account"`
+	Protocol      string `json:"protocol"`
+	ConnectMethod string `json:"connect_method"`
+	InputUsername string `json:"input_username"`
+	InputSecret   string `json:"input_secret"`
+	RemoteAddr    string `json:"remote_addr"`
+
+	Params map[string]string `json:"-"`
 }
 
-type TokenAuthInfoResponse struct {
-	Info model.ConnectTokenInfo
-	Err  []string
-}
-
-/*
-	接口返回可能是一个['Token not found']
-*/
-
-func (t *TokenAuthInfoResponse) UnmarshalJSON(p []byte) error {
-	if index := bytes.IndexByte(p, '['); index == 0 {
-		return json.Unmarshal(p, &t.Err)
-	}
-	return json.Unmarshal(p, &t.Info)
+func (s *JMService) CheckTokenStatus(tokenId string) (res model.TokenCheckStatus, err error) {
+	reqURL := fmt.Sprintf(SuperConnectTokenCheckURL, tokenId)
+	_, err = s.authClient.Get(reqURL, &res)
+	return
 }

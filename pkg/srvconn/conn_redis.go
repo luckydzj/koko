@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jumpserver/koko/pkg/localcommand"
+	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/mediocregopher/radix/v3"
 )
 
@@ -26,15 +27,15 @@ func NewRedisConnection(ops ...SqlOption) (*RedisConn, error) {
 		err  error
 	)
 	args := &sqlOption{
-		Username:         os.Getenv("USER"),
-		Password:         os.Getenv("PASSWORD"),
-		Host:             "127.0.0.1",
-		Port:             6379,
-		DBName:           "0",
-		UseSSL:           false,
-		CaCert:           "",
-		ClientCert:       "",
-		CertKey:          "",
+		Username:   os.Getenv("USER"),
+		Password:   os.Getenv("PASSWORD"),
+		Host:       "127.0.0.1",
+		Port:       6379,
+		DBName:     "0",
+		UseSSL:     false,
+		CaCert:     "",
+		ClientCert: "",
+		CertKey:    "",
 		win: Windows{
 			Width:  80,
 			Height: 120,
@@ -89,13 +90,18 @@ func (conn *RedisConn) KeepAlive() error {
 }
 
 func (conn *RedisConn) Close() error {
-	_, _ = conn.Write([]byte("\r\nexit\r\n"))
+	_, _ = conn.Write(cleanLineExitCommand)
 	return conn.LocalCommand.Close()
 }
 
 func startRedisCommand(opt *sqlOption) (lcmd *localcommand.LocalCommand, err error) {
 	cmd := opt.RedisCommandArgs()
-	lcmd, err = localcommand.New("redis-cli", cmd, localcommand.WithPtyWin(opt.win.Width, opt.win.Height))
+	opts, err := BuildNobodyWithOpts(localcommand.WithPtyWin(opt.win.Width, opt.win.Height))
+	if err != nil {
+		logger.Errorf("build nobody with opts error: %s", err)
+		return nil, err
+	}
+	lcmd, err = localcommand.New("redis-cli", cmd, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -133,6 +139,7 @@ func (opt *sqlOption) RedisCommandArgs() []string {
 	if opt.Password != "" {
 		params = append(params, "--askpass")
 	}
+	params = append(params, "--raw")
 	return params
 }
 
@@ -145,8 +152,12 @@ func checkRedisAccount(args *sqlOption) error {
 		dialOptions = append(dialOptions, radix.DialAuthPass(args.Password))
 	}
 
-	if args.UseSSL{
+	if args.UseSSL {
 		tlsConfig := tls.Config{}
+		// 连接使用的是内部地址或者localhost时，跳过证书验证
+		if args.Host == "127.0.0.1" || args.Host == "localhost" {
+			tlsConfig.InsecureSkipVerify = true
+		}
 		if args.CaCert != "" {
 			rootCAs := x509.NewCertPool()
 			rootCAs.AppendCertsFromPEM([]byte(args.CaCert))
@@ -169,5 +180,6 @@ func checkRedisAccount(args *sqlOption) error {
 		return err
 	}
 	defer conn.Close()
-	return nil
+	err = conn.Do(radix.Cmd(nil, "PING"))
+	return err
 }

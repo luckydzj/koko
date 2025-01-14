@@ -3,11 +3,14 @@ package srvconn
 import (
 	"errors"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/pkg/sftp"
+	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/jumpserver/koko/pkg/config"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
@@ -18,7 +21,7 @@ const (
 	SearchFolderName = "_Search"
 )
 
-var errNoSystemUser = errors.New("please select one of the systemUsers")
+var errNoAccountUser = errors.New("please select one of the account user")
 
 type SearchResultDir struct {
 	subDirs    map[string]os.FileInfo
@@ -79,6 +82,7 @@ func NewNodeDir(builders ...FolderBuilderOption) NodeDir {
 		ID:          dirConf.ID,
 		folderName:  dirConf.Name,
 		subDirs:     map[string]os.FileInfo{},
+		_subDirs:    sync.Map{},
 		modeTime:    time.Now().UTC(),
 		once:        new(sync.Once),
 		loadSubFunc: dirConf.loadSubFunc,
@@ -93,11 +97,22 @@ type folderOptions struct {
 	ID          string
 	Name        string
 	RemoteAddr  string
+	fromType    model.LabelField
 	loadSubFunc SubFoldersLoadFunc
 
-	asset       *model.Asset
-	systemUsers []model.SystemUser
-	domain      *model.Domain
+	asset *model.PermAsset
+
+	token *model.ConnectToken
+
+	accountUsername string
+
+	terminalCfg *model.TerminalConfig
+}
+
+func WithFolderUsername(username string) FolderBuilderOption {
+	return func(info *folderOptions) {
+		info.accountUsername = username
+	}
 }
 
 func WithFolderName(name string) FolderBuilderOption {
@@ -124,58 +139,146 @@ func WithSubFoldersLoadFunc(loadFunc SubFoldersLoadFunc) FolderBuilderOption {
 	}
 }
 
-func WithAsset(asset model.Asset) FolderBuilderOption {
+func WithAsset(asset model.PermAsset) FolderBuilderOption {
 	return func(info *folderOptions) {
 		info.asset = &asset
 	}
 }
 
-func WithSystemUsers(systemUsers []model.SystemUser) FolderBuilderOption {
+func WithToken(token *model.ConnectToken) FolderBuilderOption {
 	return func(info *folderOptions) {
-		info.systemUsers = systemUsers
+		info.token = token
 	}
 }
 
-func WithDomain(domain model.Domain) FolderBuilderOption {
+func WithFromType(fromType model.LabelField) FolderBuilderOption {
 	return func(info *folderOptions) {
-		info.domain = &domain
+		info.fromType = fromType
 	}
 }
 
-func NewAssetDir(jmsService *service.JMService, user *model.User, logChan chan<- *model.FTPLog,
-	opts ...FolderBuilderOption) AssetDir {
+func WithTerminalConfig(cfg *model.TerminalConfig) FolderBuilderOption {
+	return func(info *folderOptions) {
+		info.terminalCfg = cfg
+	}
+}
+
+func NewAssetDir(jmsService *service.JMService, user *model.User, opts ...FolderBuilderOption) *AssetDir {
 	var dirOpts folderOptions
 	for _, setter := range opts {
 		setter(&dirOpts)
 	}
 	conf := config.GetConf()
-	return AssetDir{
-		ID:          dirOpts.ID,
-		folderName:  dirOpts.Name,
-		addr:        dirOpts.RemoteAddr,
+	detailAsset := dirOpts.asset
+	var permAccounts []model.PermAccount
+	if dirOpts.token != nil {
+		account := dirOpts.token.Account
+		actions := dirOpts.token.Actions
+		permAccount := model.PermAccount{
+			Name:       account.Name,
+			Username:   account.Username,
+			SecretType: account.SecretType.Value,
+			Actions:    actions,
+		}
+		permAccounts = append(permAccounts, permAccount)
+		detailAsset = dirOpts.asset
+	}
+	return &AssetDir{
+		opts:        dirOpts,
 		user:        user,
-		detailAsset: dirOpts.asset,
-		domain:      dirOpts.domain,
+		detailAsset: detailAsset,
 		modeTime:    time.Now().UTC(),
-		suMaps:      generateSubSystemUsersFolderMap(dirOpts.systemUsers),
-		logChan:     logChan,
+		suMaps:      generateSubAccountsFolderMap(permAccounts),
 		ShowHidden:  conf.ShowHiddenFile,
-		reuse:       conf.ReuseConnection,
-		sftpClients: map[string]*SftpConn{},
-		jmsService:  jmsService,
+
+		sftpSessions: sync.Map{},
+		jmsService:   jmsService,
 	}
 }
 
+type SftpFile struct {
+	*sftp.File
+	FTPLog *model.FTPLog
+
+	cleanupFunc func()
+}
+
+func (s *SftpFile) Close() error {
+	if s.cleanupFunc != nil {
+		s.cleanupFunc()
+	}
+	return s.File.Close()
+}
+
 type SftpConn struct {
+	permAccount *model.PermAccount
 	HomeDirPath string
 	client      *sftp.Client
+	sshClient   *SSHClient
+	sshSession  *gossh.Session
+	token       *model.ConnectToken
+	isClosed    bool
+	rootDirPath string
+
+	nextExpiredTime time.Time
+	refs            atomic.Int32
+	lock            sync.Mutex
+	maxIdleTime     time.Duration
 }
+
+func (s *SftpConn) IsExpired() bool {
+	if s.Ref() > 0 {
+		// some client is using
+		return false
+	}
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	now := time.Now()
+	return now.Sub(s.nextExpiredTime) > 0 || s.token.ExpireAt.IsExpired(now)
+}
+
+func (s *SftpConn) UpdateExpiredTime() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.nextExpiredTime = time.Now().Add(s.maxIdleTime)
+}
+
+func (s *SftpConn) IncreaseRef() {
+	s.refs.Add(1)
+	s.UpdateExpiredTime()
+}
+
+func (s *SftpConn) DecreaseRef() {
+	s.refs.Add(-1)
+	s.UpdateExpiredTime()
+}
+
+func (s *SftpConn) Ref() int32 {
+	return s.refs.Load()
+}
+
+func (s *SftpConn) IsOverwriteFile() bool {
+	resolution := s.token.ConnectOptions.FilenameConflictResolution
+	return !strings.EqualFold(resolution, FilenamePolicySuffix)
+}
+
+// check if the path is root path and disable to remove
+
+func (s *SftpConn) IsRootPath(path string) bool {
+	return s.rootDirPath == path
+}
+
+const (
+	FilenamePolicyReplace = "replace"
+	FilenamePolicySuffix  = "suffix"
+)
 
 func (s *SftpConn) Close() {
 	if s.client == nil {
 		return
 	}
 	_ = s.client.Close()
+	s.isClosed = true
 }
 
 func NewFakeFile(name string, isDir bool) *FakeFileInfo {

@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jumpserver/koko/pkg/exchange"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/common"
@@ -29,7 +29,17 @@ type SwitchSession struct {
 
 	p *Server
 
-	terminateAdmin atomic.Value // 终断会话的管理员名称
+	currentOperator atomic.Value // 终断会话的管理员名称
+
+	pausedStatus atomic.Bool // 暂停状态
+
+	notifyMsgChan chan *exchange.RoomMessage
+
+	MaxSessionTime time.Time
+
+	invalidPerm     atomic.Bool
+	invalidPermData []byte
+	invalidPermTime time.Time
 }
 
 func (s *SwitchSession) Terminate(username string) {
@@ -37,22 +47,83 @@ func (s *SwitchSession) Terminate(username string) {
 	case <-s.ctx.Done():
 		return
 	default:
-		s.setTerminateAdmin(username)
+		s.setOperator(username)
 	}
 	s.cancel()
-	logger.Infof("Session[%s] receive terminate task from admin %s", s.ID, username)
+	logger.Infof("Session[%s] receive terminate task from %s", s.ID, username)
 }
 
-func (s *SwitchSession) setTerminateAdmin(username string) {
-	s.terminateAdmin.Store(username)
+func (s *SwitchSession) PauseOperation(username string) {
+	s.pausedStatus.Store(true)
+	s.setOperator(username)
+	logger.Infof("Session[%s] receive pause task from %s", s.ID, username)
+	p, _ := json.Marshal(map[string]string{"user": username})
+	s.notifyMsgChan <- &exchange.RoomMessage{
+		Event: exchange.PauseEvent,
+		Body:  p,
+	}
 }
 
-func (s *SwitchSession) loadTerminateAdmin() string {
-	return s.terminateAdmin.Load().(string)
+func (s *SwitchSession) ResumeOperation(username string) {
+	s.pausedStatus.Store(false)
+	s.setOperator(username)
+	logger.Infof("Session[%s] receive resume task from %s", s.ID, username)
+	p, _ := json.Marshal(map[string]string{"user": username})
+	s.notifyMsgChan <- &exchange.RoomMessage{
+		Event: exchange.ResumeEvent,
+		Body:  p,
+	}
 }
 
-func (s *SwitchSession) SessionID() string {
-	return s.ID
+func (s *SwitchSession) PermBecomeExpired(code, detail string) {
+	if s.invalidPerm.Load() {
+		return
+	}
+	s.invalidPerm.Store(true)
+	p, _ := json.Marshal(map[string]string{"code": code, "detail": detail})
+	s.invalidPermData = p
+	s.invalidPermTime = time.Now()
+	s.notifyMsgChan <- &exchange.RoomMessage{
+		Event: exchange.PermExpiredEvent, Body: p}
+}
+
+func (s *SwitchSession) PermBecomeValid(code, detail string) {
+	if !s.invalidPerm.Load() {
+		return
+	}
+	s.invalidPerm.Store(false)
+	s.invalidPermTime = s.MaxSessionTime
+	p, _ := json.Marshal(map[string]string{"code": code, "detail": detail})
+	s.invalidPermData = p
+	s.notifyMsgChan <- &exchange.RoomMessage{
+		Event: exchange.PermValidEvent, Body: p}
+}
+
+func (s *SwitchSession) CheckPermissionExpired(now time.Time) bool {
+	if s.p.CheckPermissionExpired(now) {
+		return true
+	}
+	if s.invalidPerm.Load() {
+		if now.After(s.invalidPermTime.Add(10 * time.Minute)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SwitchSession) setOperator(username string) {
+	s.currentOperator.Store(username)
+}
+
+func (s *SwitchSession) loadOperator() string {
+	return s.currentOperator.Load().(string)
+}
+
+func (s *SwitchSession) filterUserInput(p []byte) []byte {
+	if s.pausedStatus.Load() {
+		return nil
+	}
+	return p
 }
 
 func (s *SwitchSession) recordCommand(cmdRecordChan chan *ExecutedCommand) {
@@ -72,33 +143,22 @@ func (s *SwitchSession) recordCommand(cmdRecordChan chan *ExecutedCommand) {
 // generateCommandResult 生成命令结果
 func (s *SwitchSession) generateCommandResult(item *ExecutedCommand) *model.Command {
 	var (
-		input     string
-		output    string
-		riskLevel int64
-		user      string
+		input  string
+		output string
+		user   string
 	)
 	user = item.User.User
-	if len(item.Command) > 128 {
-		input = item.Command[:128]
+	if len(item.Command) > maxBufSize {
+		input = item.Command[:maxBufSize]
 	} else {
 		input = item.Command
 	}
-	i := strings.LastIndexByte(item.Output, '\r')
-	if i <= 0 {
-		output = item.Output
-	} else if i > 0 && i < 1024 {
-		output = item.Output[:i]
-	} else {
-		output = item.Output[:1024]
+	output = item.Output
+	if len(output) > maxBufSize {
+		output = item.Output[:maxBufSize]
 	}
 
-	switch item.RiskLevel {
-	case model.HighRiskFlag:
-		riskLevel = model.DangerLevel
-	default:
-		riskLevel = model.NormalLevel
-	}
-	return s.p.GenerateCommandItem(user, input, output, riskLevel, item.CreatedDate)
+	return s.p.GenerateCommandItem(user, input, output, item)
 }
 
 // Bridge 桥接两个链接
@@ -113,6 +173,7 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 	userInputMessageChan := make(chan *exchange.RoomMessage, 1)
 	// 处理数据流
 	userOutChan, srvOutChan := parser.ParseStream(userInputMessageChan, srvInChan)
+	parser.SetUserInputFilter(s.filterUserInput)
 
 	defer func() {
 		close(done)
@@ -143,15 +204,43 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 	go func() {
 		var (
 			exitFlag bool
-			err      error
-			nr       int
 		)
+		buffer := bytes.NewBuffer(make([]byte, 0, 1024*2))
+		/*
+		 这里使用了一个buffer，将用户输入的数据进行了分包，分包的依据是utf8编码的字符。
+		*/
+		maxLen := 1024
 		for {
-			buf := make([]byte, 1024)
-			nr, err = srvConn.Read(buf)
+			buf := make([]byte, maxLen)
+			nr, err2 := srvConn.Read(buf)
+			validBytes := buf[:nr]
 			if nr > 0 {
+				isZmodem := parser.zmodemParser.IsStartSession()
+				if !isZmodem {
+					bufferLen := buffer.Len()
+					if bufferLen > 0 || nr == maxLen {
+						buffer.Write(buf[:nr])
+						validBytes = validBytes[:0]
+					}
+					remainBytes := buffer.Bytes()
+					for len(remainBytes) > 0 {
+						r, size := utf8.DecodeRune(remainBytes)
+						if r == utf8.RuneError {
+							// utf8 max 4 bytes
+							if len(remainBytes) <= 3 {
+								break
+							}
+						}
+						validBytes = append(validBytes, remainBytes[:size]...)
+						remainBytes = remainBytes[size:]
+					}
+					buffer.Reset()
+					if len(remainBytes) > 0 {
+						buffer.Write(remainBytes)
+					}
+				}
 				select {
-				case srvInChan <- buf[:nr]:
+				case srvInChan <- validBytes:
 				case <-done:
 					exitFlag = true
 					logger.Infof("Session[%s] done", s.ID)
@@ -160,8 +249,8 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 					break
 				}
 			}
-			if err != nil {
-				logger.Errorf("Session[%s] srv read err: %s", s.ID, err)
+			if err2 != nil {
+				logger.Errorf("Session[%s] srv read err: %s", s.ID, err2)
 				break
 			}
 		}
@@ -169,16 +258,18 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 		exitSignal <- struct{}{}
 		close(srvInChan)
 	}()
-	user := s.p.connOpts.user
+	user := s.p.connOpts.authInfo.User
 	meta := exchange.MetaMessage{
 		UserId:     user.ID,
 		User:       user.String(),
 		Created:    common.NewNowUTCTime().String(),
 		RemoteAddr: userConn.RemoteAddr(),
+		TerminalId: userConn.ID(),
+		Primary:    true,
+		Writable:   true,
 	}
 	room.Broadcast(&exchange.RoomMessage{
 		Event: exchange.ShareJoin,
-		Body:  nil,
 		Meta:  meta,
 	})
 	if parser.zmodemParser != nil {
@@ -201,7 +292,7 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 			nr, err := userConn.Read(buf)
 			if nr > 0 {
 				index := bytes.IndexFunc(buf[:nr], func(r rune) bool {
-					return r == '\r' || r == '\n'
+					return r == '\r'
 				})
 				if index <= 0 || !parser.NeedRecord() {
 					room.Receive(&exchange.RoomMessage{
@@ -233,32 +324,37 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 		select {
 		// 检测是否超过最大空闲时间
 		case now := <-tick.C:
+			if s.MaxSessionTime.Before(now) {
+				msg := lang.T("Session max time reached, disconnect")
+				logger.Infof("Session[%s] max session time reached, disconnect", s.ID)
+				s.disconnection(room, parser, replayRecorder, msg)
+				s.recordSessionFinished(model.ReasonErrMaxSessionTimeout)
+				return
+			}
+
 			outTime := lastActiveTime.Add(maxIdleTime)
 			if now.After(outTime) {
 				msg := fmt.Sprintf(lang.T("Connect idle more than %d minutes, disconnect"), s.MaxIdleTime)
 				logger.Infof("Session[%s] idle more than %d minutes, disconnect", s.ID, s.MaxIdleTime)
-				msg = utils.WrapperWarn(msg)
-				replayRecorder.Record([]byte(msg))
-				room.Broadcast(&exchange.RoomMessage{Event: exchange.DataEvent, Body: []byte("\n\r" + msg)})
+				s.disconnection(room, parser, replayRecorder, msg)
+				s.recordSessionFinished(model.ReasonErrIdleDisconnect)
 				return
 			}
-			if s.p.CheckPermissionExpired(now) {
+			if s.CheckPermissionExpired(now) {
 				msg := lang.T("Permission has expired, disconnect")
 				logger.Infof("Session[%s] permission has expired, disconnect", s.ID)
-				msg = utils.WrapperWarn(msg)
-				replayRecorder.Record([]byte(msg))
-				room.Broadcast(&exchange.RoomMessage{Event: exchange.DataEvent, Body: []byte("\n\r" + msg)})
+				s.disconnection(room, parser, replayRecorder, msg)
+				s.recordSessionFinished(model.ReasonErrPermissionExpired)
 				return
 			}
 			continue
 			// 手动结束
 		case <-s.ctx.Done():
-			adminUser := s.loadTerminateAdmin()
+			adminUser := s.loadOperator()
 			msg := fmt.Sprintf(lang.T("Terminated by admin %s"), adminUser)
-			msg = utils.WrapperWarn(msg)
-			replayRecorder.Record([]byte(msg))
 			logger.Infof("Session[%s]: %s", s.ID, msg)
-			room.Broadcast(&exchange.RoomMessage{Event: exchange.DataEvent, Body: []byte("\n\r" + msg)})
+			s.disconnection(room, parser, replayRecorder, msg)
+			s.recordSessionFinished(model.ReasonErrAdminTerminate)
 			return
 			// 监控窗口大小变化
 		case win, ok := <-winCh:
@@ -277,6 +373,7 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 			// 经过parse处理的server数据，发给user
 		case p, ok := <-srvOutChan:
 			if !ok {
+				s.recordSessionFinished(model.ReasonErrConnectDisconnect)
 				return
 			}
 			if parser.NeedRecord() {
@@ -290,10 +387,11 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 			// 经过parse处理的user数据，发给server
 		case p, ok := <-userOutChan:
 			if !ok {
+				s.recordSessionFinished(model.ReasonErrUserClose)
 				return
 			}
-			if _, err := srvConn.Write(p); err != nil {
-				logger.Errorf("Session[%s] srvConn write err: %s", s.ID, err)
+			if _, err1 := srvConn.Write(p); err1 != nil {
+				logger.Errorf("Session[%s] srvConn write err: %s", s.ID, err1)
 			}
 
 		case now := <-keepAliveTick.C:
@@ -305,11 +403,38 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 			continue
 		case <-userConn.Context().Done():
 			logger.Infof("Session[%s]: user conn context done", s.ID)
+			s.recordSessionFinished(model.ReasonErrUserClose)
 			return nil
 		case <-exitSignal:
 			logger.Debugf("Session[%s] end by exit signal", s.ID)
+			s.recordSessionFinished(model.ReasonErrConnectDisconnect)
 			return
+		case notifyMsg := <-s.notifyMsgChan:
+			logger.Infof("Session[%s] notify event: %s", s.ID, notifyMsg.Event)
+			room.Broadcast(notifyMsg)
+			continue
 		}
 		lastActiveTime = time.Now()
+	}
+}
+func (s *SwitchSession) disconnection(room *exchange.Room, parser *Parser, replayRecorder *ReplyRecorder, msg string) {
+	msg = utils.WrapperWarn(msg)
+	replayRecorder.Record([]byte(msg))
+
+	roomMessage := &exchange.RoomMessage{Event: exchange.DataEvent, Body: []byte("\n\r" + msg)}
+	if parser.zmodemParser.IsStartSession() {
+		expectedSize := len(zmodem.SkipSequence) + len(zmodem.CancelSequence)
+		roomMessage.Body = make([]byte, 0, expectedSize)
+		roomMessage.Body = append(roomMessage.Body, zmodem.SkipSequence...)
+		roomMessage.Body = append(roomMessage.Body, zmodem.CancelSequence...)
+	}
+
+	room.Broadcast(roomMessage)
+}
+
+func (s *SwitchSession) recordSessionFinished(reason model.SessionLifecycleReasonErr) {
+	logObj := model.SessionLifecycleLog{Reason: string(reason)}
+	if err := s.p.jmsService.RecordSessionLifecycleLog(s.ID, model.AssetConnectFinished, logObj); err != nil {
+		logger.Errorf("Session[%s] record session asset_connect_finished failed: %s", s.ID, err)
 	}
 }

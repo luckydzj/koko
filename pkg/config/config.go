@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/spf13/viper"
+
+	"github.com/jumpserver/koko/pkg/common"
 )
 
 var (
@@ -30,6 +32,7 @@ type Config struct {
 	Comment             string `mapstructure:"COMMENT"`
 	LanguageCode        string `mapstructure:"LANGUAGE_CODE"`
 	UploadFailedReplay  bool   `mapstructure:"UPLOAD_FAILED_REPLAY_ON_START"`
+	UploadFailedFTPFile bool   `mapstructure:"UPLOAD_FAILED_FTP_FILE_ON_START"`
 	AssetLoadPolicy     string `mapstructure:"ASSET_LOAD_POLICY"` // all
 	ZipMaxSize          string `mapstructure:"ZIP_MAX_SIZE"`
 	ZipTmpPath          string `mapstructure:"ZIP_TMP_PATH"`
@@ -52,19 +55,37 @@ type Config struct {
 	EnableLocalPortForward bool `mapstructure:"ENABLE_LOCAL_PORT_FORWARD"`
 	EnableVscodeSupport    bool `mapstructure:"ENABLE_VSCODE_SUPPORT"`
 
+	EnableReversePortForward bool `mapstructure:"ENABLE_REVERSE_PORT_FORWARD"`
+
+	HiddenFields []string `mapstructure:"HIDDEN_FIELDS"`
+
+	// 仅控制是否缓存 sftp 的 token 连接
+	ConnectionTokenReusable bool `mapstructure:"CONNECTION_TOKEN_REUSABLE"`
+
+	SshMaxSessions int `mapstructure:"SSH_MAX_SESSIONS"`
+
+	DisableInputAsCommand bool `mapstructure:"DISABLE_INPUT_AS_COMMAND"`
+
+	SecretEncryptKey string `mapstructure:"SECRET_ENCRYPT_KEY"`
+
 	RootPath          string
 	DataFolderPath    string
 	LogDirPath        string
 	KeyFolderPath     string
 	AccessKeyFilePath string
 	ReplayFolderPath  string
+	FTPFileFolderPath string
 	CertsFolderPath   string
 }
 
 func (c *Config) EnsureConfigValid() {
 	if c.LanguageCode == "" {
-		c.LanguageCode = "zh"
+		c.LanguageCode = "en"
 	}
+}
+
+func (c *Config) UpdateRedisPassword(val string) {
+	c.RedisPassword = val
 }
 
 func GetConf() Config {
@@ -90,6 +111,7 @@ func getDefaultConfig() Config {
 	rootPath := getPwdDirPath()
 	dataFolderPath := filepath.Join(rootPath, "data")
 	replayFolderPath := filepath.Join(dataFolderPath, "replays")
+	ftpFileFolderPath := filepath.Join(dataFolderPath, "ftp_files")
 	LogDirPath := filepath.Join(dataFolderPath, "logs")
 	keyFolderPath := filepath.Join(dataFolderPath, "keys")
 	CertsFolderPath := filepath.Join(dataFolderPath, "certs")
@@ -117,10 +139,13 @@ func getDefaultConfig() Config {
 		LogDirPath:        LogDirPath,
 		KeyFolderPath:     keyFolderPath,
 		ReplayFolderPath:  replayFolderPath,
+		FTPFileFolderPath: ftpFileFolderPath,
 		CertsFolderPath:   CertsFolderPath,
+		LanguageCode:      "en",
 
 		Comment:             "KOKO",
 		UploadFailedReplay:  true,
+		UploadFailedFTPFile: true,
 		ShowHiddenFile:      false,
 		ReuseConnection:     true,
 		AssetLoadPolicy:     "",
@@ -135,13 +160,14 @@ func getDefaultConfig() Config {
 
 		EnableLocalPortForward: false,
 		EnableVscodeSupport:    false,
+		DisableInputAsCommand:  true,
 	}
 
 }
 
 func EnsureDirExist(path string) error {
 	if !haveDir(path) {
-		if err := os.MkdirAll(path, os.ModePerm); err != nil {
+		if err := os.MkdirAll(path, 0700); err != nil {
 			return err
 		}
 	}
@@ -206,13 +232,14 @@ const (
 /*
 SERVER_HOSTNAME: 环境变量名，可用于自定义默认注册名称的前缀
 default name rule:
-[Koko]-{SERVER_HOSTNAME}-{HOSTNAME}
+[Koko]-{SERVER_HOSTNAME}-{HOSTNAME}-RandomStr
  or
-[Koko]-{HOSTNAME}
+[Koko]-{HOSTNAME}-RandomStr
 */
 
 func getDefaultName() string {
 	hostname, _ := os.Hostname()
+	hostname = fmt.Sprintf("%s-%s", hostname, common.RandomStr(7))
 	if serverHostname, ok := os.LookupEnv(hostEnvKey); ok {
 		hostname = fmt.Sprintf("%s-%s", serverHostname, hostname)
 	}

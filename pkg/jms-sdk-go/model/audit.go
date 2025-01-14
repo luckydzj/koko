@@ -5,26 +5,29 @@ import (
 )
 
 type FTPLog struct {
+	ID         string         `json:"id"`
 	User       string         `json:"user"`
-	Hostname   string         `json:"asset"`
+	Asset      string         `json:"asset"`
 	OrgID      string         `json:"org_id"`
-	SystemUser string         `json:"system_user"`
+	Account    string         `json:"account"`
 	RemoteAddr string         `json:"remote_addr"`
 	Operate    string         `json:"operate"`
 	Path       string         `json:"filename"`
 	DateStart  common.UTCTime `json:"date_start"`
 	IsSuccess  bool           `json:"is_success"`
+	Session    string         `json:"session"`
 }
 
 const (
-	OperateDownload = "Download"
-	OperateUpload   = "Upload"
+	OperateDownload = "download"
+	OperateUpload   = "upload"
 )
 
 const (
-	OperateRemoveDir = "Rmdir"
-	OperateRename    = "Rename"
-	OperateMkdir     = "Mkdir"
-	OperateDelete    = "Delete"
-	OperateSymlink   = "Symlink"
+	OperateRemoveDir = "rmdir"
+	OperateRename    = "rename"
+	OperateRenameDir = "rename_dir"
+	OperateMkdir     = "mkdir"
+	OperateDelete    = "delete"
+	OperateSymlink   = "symlink"
 )

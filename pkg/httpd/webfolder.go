@@ -1,8 +1,8 @@
 package httpd
 
 import (
-	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
-	"strings"
+	"github.com/jumpserver/koko/pkg/common"
+	"github.com/jumpserver/koko/pkg/logger"
 )
 
 var _ Handler = (*webFolder)(nil)
@@ -12,29 +12,49 @@ type webFolder struct {
 
 	done chan struct{}
 
-	targetId string
-
 	volume *UserVolume
-
-	jmsService *service.JMService
 }
 
 func (h *webFolder) Name() string {
 	return WebFolderName
 }
 
-func (h *webFolder) CheckValidation() bool {
-	jmsServiceCopy := h.jmsService.Copy()
-	if langCode, err := h.ws.ctx.Cookie("django_language"); err == nil {
-		jmsServiceCopy.SetCookie("django_language", langCode)
+func (h *webFolder) CheckValidation() error {
+	apiClient := h.ws.apiClient
+	user := h.ws.CurrentUser()
+	terminalCfg, err := h.ws.apiClient.GetTerminalConfig()
+	if err != nil {
+		logger.Errorf("Get terminal config failed: %s", err)
+		return err
 	}
-	switch strings.TrimSpace(h.targetId) {
-	case "_":
-		h.volume = NewUserVolume(jmsServiceCopy, h.ws.CurrentUser(), h.ws.ClientIP(), "")
-	default:
-		h.volume = NewUserVolume(jmsServiceCopy, h.ws.CurrentUser(), h.ws.ClientIP(), strings.TrimSpace(h.targetId))
+	volOpts := make([]VolumeOption, 0, 5)
+	volOpts = append(volOpts, WithUser(user))
+	volOpts = append(volOpts, WithAddr(h.ws.ClientIP()))
+	volOpts = append(volOpts, WithTerminalCfg(&terminalCfg))
+	params := h.ws.wsParams
+	targetId := params.TargetId
+	assetId := params.AssetId
+	if assetId == "" {
+		assetId = targetId
 	}
-	return true
+	if h.ws.ConnectToken != nil {
+		connectToken := h.ws.ConnectToken
+		volOpts = append(volOpts, WithConnectToken(connectToken))
+	} else {
+		if common.ValidUUIDString(assetId) {
+			assets, err := apiClient.GetUserAssetByID(user.ID, assetId)
+			if err != nil {
+				logger.Errorf("Get user asset %s error: %s", assetId, err)
+				return ErrAssetIdInvalid
+			}
+			if len(assets) != 1 {
+				logger.Errorf("Get user more than one asset %s: choose first", targetId)
+			}
+			volOpts = append(volOpts, WithAsset(&assets[0]))
+		}
+	}
+	h.volume = NewUserVolume(apiClient, volOpts...)
+	return nil
 }
 
 func (h *webFolder) HandleMessage(*Message) {

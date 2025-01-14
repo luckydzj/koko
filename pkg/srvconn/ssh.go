@@ -211,6 +211,19 @@ type SSHClient struct {
 	traceSessionMap map[*gossh.Session]time.Time
 
 	refCount int32
+	_selfRef int32
+}
+
+func (s *SSHClient) increaseSelfRef() {
+	s._selfRef++
+}
+
+func (s *SSHClient) decreaseSelfRef() {
+	s._selfRef--
+}
+
+func (s *SSHClient) selfRef() int32 {
+	return s._selfRef
 }
 
 func (s *SSHClient) String() string {
@@ -257,13 +270,17 @@ func (s *SSHClient) ReleaseSession(sess *gossh.Session) {
 func createSSHConfig() gossh.Config {
 	var cfg gossh.Config
 	cfg.SetDefaults()
-	cfg.Ciphers = append(cfg.Ciphers, notRecommendCiphers...)
+	ciphers := make([]string, 0, len(cfg.Ciphers)+len(notRecommendCiphers))
+	ciphers = append(ciphers, notRecommendCiphers...)
+	ciphers = append(ciphers, cfg.Ciphers...)
+	cfg.Ciphers = ciphers
 	cfg.KeyExchanges = append(cfg.KeyExchanges, notRecommendKeyExchanges...)
 	return cfg
 }
 
 var (
 	notRecommendCiphers = []string{
+		"aes128-ctr",
 		"arcfour256", "arcfour128", "arcfour",
 		"aes128-cbc", "3des-cbc",
 	}

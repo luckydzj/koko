@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jumpserver/koko/pkg/common"
@@ -31,45 +32,91 @@ type Windows struct {
 
 const (
 	ProtocolSSH    = "ssh"
+	ProtocolSFTP   = "sftp"
 	ProtocolTELNET = "telnet"
 	ProtocolK8s    = "k8s"
 
-	ProtocolMySQL        = "mysql"
-	ProtocolMariadb      = "mariadb"
-	ProtocolSQLServer    = "sqlserver"
-	ProtocolRedis        = "redis"
-	ProtocolMongoDB      = "mongodb"
-	ProtocolPostgreSQL   = "postgresql"
-	ProtocolClickHouse   = "clickhouse"
+	ProtocolRedis      = "redis"
+	ProtocolMongoDB    = "mongodb"
+	ProtocolClickHouse = "clickhouse"
+
+	ProtocolMySQL      = "mysql"
+	ProtocolMariadb    = "mariadb"
+	ProtocolSQLServer  = "sqlserver"
+	ProtocolPostgresql = "postgresql"
+	ProtocolOracle     = "oracle"
 )
+
+func SupportedDBProtocols() []string {
+	return []string{
+		ProtocolRedis,
+		ProtocolMongoDB,
+
+		ProtocolMySQL,
+		ProtocolMariadb,
+		ProtocolOracle,
+		ProtocolSQLServer,
+		ProtocolPostgresql,
+		ProtocolClickHouse,
+	}
+}
+
+func SupportedHostProtocols() []string {
+	return []string{
+		ProtocolSSH,
+		ProtocolTELNET,
+	}
+}
+
+func SupportedProtocols() []string {
+	protocols := make([]string, 0, len(supportedMap))
+	for k := range supportedMap {
+		protocols = append(protocols, k)
+	}
+	return protocols
+}
+
+type ErrNoClient struct {
+	Name string
+}
+
+func (e ErrNoClient) Error() string {
+	return fmt.Sprintf("not found %s client", e.Name)
+}
+
+type ErrUSQLNoSupported struct {
+	Name string
+}
+
+func (e ErrUSQLNoSupported) Error() string {
+	return fmt.Sprintf("usql client not supported %s", e.Name)
+}
 
 var (
 	ErrUnSupportedProtocol = errors.New("unsupported protocol")
 
-	ErrKubectlClient = errors.New("not found Kubectl client")
+	ErrKubectlClient = ErrNoClient{"Kubectl"}
 
-	ErrRedisClient   = errors.New("not found Redis client")
-	ErrMongoDBClient = errors.New("not found MongoDB client")
-
-	ErrMySQLClient     = errors.New("not found MySQL client")
-	ErrSQLServerClient = errors.New("not found SQLServer client")
-	ErrPostgreSQLClient = errors.New("not found PostgreSQL client")
-	ErrClickHouseClient = errors.New("not found ClickHouse client")
+	ErrRedisClient   = ErrNoClient{"Redis"}
+	ErrMongoDBClient = ErrNoClient{"MongoDB"}
 )
 
 type supportedChecker func() error
 
 var supportedMap = map[string]supportedChecker{
-	ProtocolSSH:          builtinSupported,
-	ProtocolTELNET:       builtinSupported,
-	ProtocolK8s:          kubectlSupported,
-	ProtocolMySQL:        mySQLSupported,
-	ProtocolMariadb:      mySQLSupported,
-	ProtocolSQLServer:    sqlServerSupported,
-	ProtocolRedis:        redisSupported,
-	ProtocolMongoDB:      mongoDBSupported,
-	ProtocolPostgreSQL:   postgreSQLSupported,
-	ProtocolClickHouse:   clickhouseSupported,
+	ProtocolSSH:    builtinSupported,
+	ProtocolTELNET: builtinSupported,
+	ProtocolK8s:    kubectlSupported,
+
+	ProtocolRedis:   redisSupported,
+	ProtocolMongoDB: mongoDBSupported,
+
+	ProtocolMySQL:      usqlSupportedChecker(ProtocolMySQL),
+	ProtocolMariadb:    usqlSupportedChecker(ProtocolMariadb),
+	ProtocolSQLServer:  usqlSupportedChecker(ProtocolSQLServer),
+	ProtocolPostgresql: usqlSupportedChecker(ProtocolPostgresql),
+	ProtocolClickHouse: usqlSupportedChecker(ProtocolClickHouse),
+	ProtocolOracle:     usqlSupportedChecker(ProtocolOracle),
 }
 
 func IsSupportedProtocol(p string) error {
@@ -101,19 +148,6 @@ func kubectlSupported() error {
 	return ErrKubectlClient
 }
 
-func mySQLSupported() error {
-	checkLine := "mysql -V"
-	cmd := exec.Command("bash", "-c", checkLine)
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return fmt.Errorf("%w: %s", ErrMySQLClient, err)
-	}
-	if bytes.HasPrefix(out, []byte("mysql")) {
-		return nil
-	}
-	return ErrMySQLClient
-}
-
 func redisSupported() error {
 	checkLine := "redis-cli -v"
 	cmd := exec.Command("bash", "-c", checkLine)
@@ -137,48 +171,33 @@ func mongoDBSupported() error {
 	if !bytes.HasSuffix(out, []byte("command not found")) {
 		return nil
 	}
-	return ErrRedisClient
+	return ErrMongoDBClient
 }
 
-func sqlServerSupported() error {
-	checkLine := "tsql -C"
-	cmd := exec.Command("bash", "-c", checkLine)
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return fmt.Errorf("%w: %s", ErrSQLServerClient, err)
-	}
-	if strings.Contains(string(out), "freetds") {
+var usqlSupportedProtocols string
+var once sync.Once
+
+func ensureUSQLSupported() {
+	once.Do(func() {
+		checkLine := "usql -c '\\drivers'"
+		cmd := exec.Command("bash", "-c", checkLine)
+		out, err := cmd.CombinedOutput()
+		if err != nil && len(out) == 0 {
+			return
+		}
+		usqlSupportedProtocols = string(bytes.TrimSpace(out))
+	})
+}
+
+func usqlSupportedChecker(protocol string) func() error {
+	ensureUSQLSupported()
+	return func() error {
+		if !strings.Contains(usqlSupportedProtocols, protocol) {
+			return ErrUSQLNoSupported{Name: protocol}
+		}
 		return nil
 	}
-	return ErrSQLServerClient
 }
-
-func postgreSQLSupported() error {
-	checkLine := "psql -V"
-	cmd := exec.Command("bash", "-c", checkLine)
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return fmt.Errorf("%w: %s", ErrPostgreSQLClient, err)
-	}
-	if bytes.HasPrefix(out, []byte("psql")) {
-		return nil
-	}
-	return ErrPostgreSQLClient
-}
-
-func clickhouseSupported() error {
-	checkLine := "clickhouse-client -V"
-	cmd := exec.Command("bash", "-c", checkLine)
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return fmt.Errorf("%w: %s", ErrClickHouseClient, err)
-	}
-	if bytes.HasPrefix(out, []byte("ClickHouse")) {
-		return nil
-	}
-	return ErrClickHouseClient
-}
-
 
 func MatchLoginPrefix(prefix string, dbType string, lcmd *localcommand.LocalCommand) (*localcommand.LocalCommand, error) {
 	var (
@@ -235,13 +254,22 @@ func DoLogin(opt *sqlOption, lcmd *localcommand.LocalCommand, dbType string) (*l
 	return lcmd, nil
 }
 
-func StoreCAFileToLocal(caCert string) (caFilepath string, err error)  {
-	if caCert == "" {
+func StoreCAFileToLocal(caCert string) (string, error) {
+	return createTmpFileToLocal(caCert, 0666)
+}
+
+func StorePrivateKeyFileToLocal(caCert string) (string, error) {
+	return createTmpFileToLocal(caCert, 0600)
+}
+
+func createTmpFileToLocal(content string, perm os.FileMode) (string, error) {
+
+	if content == "" {
 		return "", nil
 	}
 
 	baseDir := "./.ca_temp"
-	_, err = os.Stat(baseDir)
+	_, err := os.Stat(baseDir)
 	if os.IsNotExist(err) {
 		err = os.Mkdir(baseDir, os.ModePerm)
 		if err != nil {
@@ -250,15 +278,15 @@ func StoreCAFileToLocal(caCert string) (caFilepath string, err error)  {
 	}
 
 	filename := fmt.Sprintf("%s.pem", common.UUID())
-	caFilepath = filepath.Join(baseDir, filename)
-	file, err := os.OpenFile(caFilepath, os.O_WRONLY | os.O_CREATE, 0600)
+	path := filepath.Join(baseDir, filename)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, perm)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	_, _ = file.WriteString(caCert)
+	_, _ = file.WriteString(content)
 
-	return caFilepath, err
+	return path, err
 }
 
 func ClearTempFileDelay(sleepTime time.Duration, filepath ...string) {
@@ -268,8 +296,20 @@ func ClearTempFileDelay(sleepTime time.Duration, filepath ...string) {
 			_, err := os.Stat(file)
 			if err == nil {
 				logger.Debugf("Clean up file: %s", file)
-				err = os.Remove(file)
+				if err = os.Remove(file); err != nil {
+					logger.Errorf("Clean up file err: %s", err)
+				}
 			}
 		}
 	}()
 }
+
+var cleanLineExitCommand = []byte{
+	CharCTRLE, CharCleanLine, '\r', '\n',
+	'e', 'x', 'i', 't', '\r', '\n',
+}
+
+const (
+	CharCleanLine = '\x15'
+	CharCTRLE     = '\x05'
+)

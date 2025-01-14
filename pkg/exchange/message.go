@@ -9,22 +9,29 @@ type RoomMessage struct {
 	Meta MetaMessage `json:"meta"` // receive的信息必须携带Meta
 }
 
+func (m *RoomMessage) Marshal() []byte {
+	p, _ := json.Marshal(m)
+	return p
+}
+
 type MetaMessage struct {
 	UserId     string `json:"user_id"`
 	User       string `json:"user"`
 	Created    string `json:"created"`
 	RemoteAddr string `json:"remote_addr"`
-}
 
-func (m RoomMessage) Marshal() []byte {
-	p, _ := json.Marshal(m)
-	return p
+	TerminalId string `json:"terminal_id"`
+	Primary    bool   `json:"primary"`
+	Writable   bool   `json:"writable"`
 }
 
 const (
 	PingEvent    = "Ping"
 	DataEvent    = "Data"
 	WindowsEvent = "Windows"
+
+	PauseEvent  = "Pause"
+	ResumeEvent = "Resume"
 
 	JoinEvent  = "Join"
 	LeaveEvent = "Leave"
@@ -38,6 +45,11 @@ const (
 	ShareUsers = "Share_USERS"
 
 	ActionEvent = "Action"
+
+	PermExpiredEvent = "PermExpired"
+	PermValidEvent   = "PermValid"
+
+	ShareRemoveUser = "Share_REMOVE_USER"
 )
 
 const (

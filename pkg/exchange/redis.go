@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/mediocregopher/radix/v3"
-	uuid "github.com/satori/go.uuid"
 
+	"github.com/jumpserver/koko/pkg/common"
 	"github.com/jumpserver/koko/pkg/logger"
 )
 
@@ -136,6 +136,8 @@ func newRedisManager(cfg Config) (*redisRoomManager, error) {
 		sentinelOpts = append(sentinelOpts, dialOptions...)
 		if cfg.SentinelPassword != "" {
 			sentinelOpts = append(sentinelOpts, radix.DialAuthPass(cfg.SentinelPassword))
+		} else {
+			sentinelOpts = append(sentinelOpts, radix.DialAuthUser("", ""))
 		}
 		sentinelConnFunc := func(network, addr string) (radix.Conn, error) {
 			conn, err := radix.Dial(network, addr, sentinelOpts...)
@@ -186,7 +188,7 @@ func newRedisManager(cfg Config) (*redisRoomManager, error) {
 	}
 
 	m := &redisRoomManager{
-		Id:                     uuid.NewV4().String(),
+		Id:                     common.UUID(),
 		pool:                   pool,
 		connFunc:               connFunc,
 		localRoomCache:         newLocalCache(),

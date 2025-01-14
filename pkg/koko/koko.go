@@ -2,7 +2,6 @@ package koko
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,23 +18,12 @@ import (
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 )
 
-var Version = "unknown"
-
 type Koko struct {
 	webSrv *httpd.Server
 	sshSrv *sshd.Server
 }
 
-const (
-	timeFormat      = "2006-01-02 15:04:05"
-	startWelcomeMsg = `%s
-KoKo Version %s, more see https://www.jumpserver.org
-Quit the server with CONTROL-C.
-`
-)
-
 func (k *Koko) Start() {
-	fmt.Printf(startWelcomeMsg, time.Now().Format(timeFormat), Version)
 	go k.webSrv.Start()
 	go k.sshSrv.Start()
 }
@@ -52,10 +40,9 @@ func RunForever(confPath string) {
 	gracefulStop := make(chan os.Signal, 1)
 	signal.Notify(gracefulStop, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
 	jmsService := MustJMService()
-	srv := NewServer(jmsService)
+	bootstrapWithJMService(jmsService)
 	webSrv := httpd.NewServer(jmsService)
-	registerWebHandlers(jmsService, webSrv)
-	sshSrv := sshd.NewSSHServer(srv)
+	sshSrv := sshd.NewSSHServer(jmsService)
 	app := &Koko{
 		webSrv: webSrv,
 		sshSrv: sshSrv,
@@ -69,28 +56,41 @@ func RunForever(confPath string) {
 func bootstrap() {
 	i18n.Initial()
 	logger.Initial()
+}
+
+func bootstrapWithJMService(jmsService *service.JMService) {
+	updateEncryptConfigValue(jmsService)
 	exchange.Initial()
+}
+
+func updateEncryptConfigValue(jmsService *service.JMService) {
+	cfg := config.GlobalConfig
+	encryptKey := cfg.SecretEncryptKey
+	if encryptKey != "" {
+		redisPassword := cfg.RedisPassword
+		ret, err := jmsService.GetEncryptedConfigValue(encryptKey, redisPassword)
+		if err != nil {
+			logger.Error("Get encrypted config value failed: " + err.Error())
+			return
+		}
+		if ret.Value != "" {
+			cfg.UpdateRedisPassword(ret.Value)
+		} else {
+			logger.Error("Get encrypted config value failed: empty value")
+		}
+	}
 }
 
 func runTasks(jmsService *service.JMService) {
 	if config.GetConf().UploadFailedReplay {
 		go uploadRemainReplay(jmsService)
 	}
+	if config.GetConf().UploadFailedFTPFile {
+		go uploadRemainFTPFile(jmsService)
+	}
 	go keepHeartbeat(jmsService)
-}
 
-func NewServer(jmsService *service.JMService) *server {
-	terminalConf, err := jmsService.GetTerminalConfig()
-	if err != nil {
-		logger.Fatal(err)
-	}
-	app := server{
-		jmsService:    jmsService,
-		vscodeClients: make(map[string]*vscodeReq),
-	}
-	app.UpdateTerminalConfig(terminalConf)
-	go app.run()
-	return &app
+	go RunConnectTokensCheck(jmsService)
 }
 
 func MustJMService() *service.JMService {

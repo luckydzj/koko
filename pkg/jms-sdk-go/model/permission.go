@@ -28,6 +28,14 @@ func (p *Permission) EnablePaste() bool {
 	return p.haveAction(ActionPaste)
 }
 
+func (p *Permission) EnableDelete() bool {
+	return p.haveAction(ActionDelete)
+}
+
+func (p *Permission) EnableShare() bool {
+	return p.haveAction(ActionShare)
+}
+
 func (p *Permission) haveAction(action string) bool {
 	for _, value := range p.Actions {
 		if action == ActionALL || action == value {
@@ -38,14 +46,14 @@ func (p *Permission) haveAction(action string) bool {
 }
 
 const (
-	ActionALL            = "all"
-	ActionConnect        = "connect"
-	ActionUpload         = "upload_file"
-	ActionDownload       = "download_file"
-	ActionUploadDownLoad = "updownload"
-	ActionCopy           = "clipboard_copy"
-	ActionPaste          = "clipboard_paste"
-	ActionCopyPaste      = "clipboard_copy_paste"
+	ActionALL      = "all"
+	ActionConnect  = "connect"
+	ActionUpload   = "upload"
+	ActionDownload = "download"
+	ActionCopy     = "copy"
+	ActionPaste    = "paste"
+	ActionDelete   = "delete"
+	ActionShare    = "share"
 )
 
 type ValidateResult struct {

@@ -5,10 +5,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jumpserver/koko/pkg/exchange"
+	"github.com/jumpserver/koko/pkg/common"
 	"github.com/jumpserver/koko/pkg/i18n"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
 	"github.com/jumpserver/koko/pkg/logger"
+	"github.com/jumpserver/koko/pkg/utils"
 )
 
 func (h *InteractiveHandler) Dispatch() {
@@ -47,6 +48,10 @@ func (h *InteractiveHandler) Dispatch() {
 			case "b":
 				h.selectHandler.MovePrePage()
 				continue
+			case "h":
+				h.selectHandler.SetSelectType(TypeHost)
+				h.selectHandler.Search("")
+				continue
 			case "d":
 				h.selectHandler.SetSelectType(TypeDatabase)
 				h.selectHandler.Search("")
@@ -58,7 +63,7 @@ func (h *InteractiveHandler) Dispatch() {
 				h.wg.Wait() // 等待node加载完成
 				h.displayNodeTree(h.nodes)
 				continue
-			case "h":
+			case "?":
 				h.displayHelp()
 				initialed = false
 				continue
@@ -103,10 +108,6 @@ func (h *InteractiveHandler) Dispatch() {
 						continue
 					}
 				}
-			case strings.Index(line, "join") == 0:
-				roomID := strings.TrimSpace(strings.TrimPrefix(line, "join"))
-				JoinRoom(h, roomID)
-				continue
 			}
 		}
 		h.selectHandler.SearchOrProxy(line)
@@ -121,13 +122,69 @@ func (h *InteractiveHandler) checkMaxIdleTime(checkChan <-chan bool) {
 func (h *InteractiveHandler) ChangeLang() {
 	lang := i18n.NewLang(h.i18nLang)
 	i18nLang := h.i18nLang
-	switch lang {
-	case i18n.EN:
-		i18nLang = i18n.ZH.String()
-	case i18n.ZH:
-		i18nLang = i18n.JA.String()
-	case i18n.JA:
-		i18nLang = i18n.EN.String()
+	allLangCodes := []i18n.LanguageCode{i18n.EN, i18n.ZH, i18n.ZHHant, i18n.JA, i18n.PtBr}
+	langs := []string{"English", "中文", "繁體中文", "日本語", "Português"}
+	idLabel := lang.T("ID")
+	nameLabel := lang.T("Name")
+	labels := []string{idLabel, nameLabel}
+	fields := []string{"ID", "Name"}
+	data := make([]map[string]string, len(langs))
+	for i, j := range langs {
+		row := make(map[string]string)
+		row["ID"] = strconv.Itoa(i + 1)
+		row["Name"] = j
+		data[i] = row
+	}
+	w, _ := h.GetPtySize()
+	table := common.WrapperTable{
+		Fields: fields,
+		Labels: labels,
+		FieldsSize: map[string][3]int{
+			"ID":   {0, 0, 5},
+			"Name": {0, 8, 0},
+		},
+		Data:        data,
+		TotalSize:   w,
+		TruncPolicy: common.TruncMiddle,
+	}
+	table.Initial()
+
+	h.term.SetPrompt("ID> ")
+	selectTip := lang.T("Tips: switch language by ID")
+	backTip := lang.T("Back: B/b")
+	for i := 0; i < 3; i++ {
+		utils.IgnoreErrWriteString(h.term, table.Display())
+		utils.IgnoreErrWriteString(h.term, utils.WrapperString(selectTip, utils.Green))
+		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+		utils.IgnoreErrWriteString(h.term, utils.WrapperString(backTip, utils.Green))
+		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+		line, err := h.term.ReadLine()
+		if err != nil {
+			logger.Errorf("User %s switch language err %s", h.user.Name, err)
+			break
+		}
+		line = strings.TrimSpace(line)
+		switch strings.ToLower(line) {
+		case "q", "b", "quit", "exit", "back":
+			logger.Infof("User %s switch language exit", h.user.Name)
+			return
+		case "":
+			continue
+		}
+		if num, err2 := strconv.Atoi(line); err2 == nil {
+			if num > 0 && num <= len(allLangCodes) {
+				lang = allLangCodes[num-1]
+				i18nLang = lang.String()
+				break
+			} else {
+				utils.IgnoreErrWriteString(h.term, utils.WrapperString(lang.T("Invalid ID"), utils.Red))
+				utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
+			}
+		}
+	}
+	if i18nLang != h.i18nLang {
+		utils.IgnoreErrWriteString(h.term, utils.WrapperString(lang.T("Switch language successfully"), utils.Green))
+		utils.IgnoreErrWriteString(h.term, utils.CharNewLine)
 	}
 	userLangGlobalStore.Store(h.user.ID, i18nLang)
 	h.i18nLang = i18nLang
@@ -135,46 +192,12 @@ func (h *InteractiveHandler) ChangeLang() {
 
 func (h *InteractiveHandler) displayNodeTree(nodes model.NodeList) {
 	lang := i18n.NewLang(h.i18nLang)
-	tree := ConstructNodeTree(nodes)
+	tree, newNodes := ConstructNodeTree(nodes)
+	h.nodes = newNodes
 	_, _ = io.WriteString(h.term, "\n\r"+lang.T("Node: [ ID.Name(Asset amount) ]"))
 	_, _ = io.WriteString(h.term, tree.String())
 	_, err := io.WriteString(h.term, lang.T("Tips: Enter g+NodeID to display the host under the node, such as g1")+"\n\r")
 	if err != nil {
-		logger.Info("displayAssetNodes err:", err)
-	}
-}
-
-func (h *InteractiveHandler) CheckShareRoomWritePerm(shareRoomID string) bool {
-	// todo: check current user has pem to write
-	return false
-}
-
-func (h *InteractiveHandler) CheckShareRoomReadPerm(shareRoomID string) bool {
-	ret, err := h.jmsService.ValidateJoinSessionPermission(h.user.ID, shareRoomID)
-	if err != nil {
-		logger.Error(err)
-		return false
-	}
-	return ret.Ok
-
-}
-
-func JoinRoom(h *InteractiveHandler, roomId string) {
-	if room := exchange.GetRoom(roomId); room != nil {
-		conn := exchange.WrapperUserCon(h.sess)
-		room.Subscribe(conn)
-		defer room.UnSubscribe(conn)
-		for {
-			buf := make([]byte, 1024)
-			nr, err := h.sess.Read(buf)
-			if nr > 0 && h.CheckShareRoomWritePerm(roomId) {
-				room.Receive(&exchange.RoomMessage{
-					Event: exchange.DataEvent, Body: buf[:nr]})
-			}
-			if err != nil {
-				break
-			}
-		}
-		logger.Infof("Conn[%s] user read end", h.sess.Uuid)
+		logger.Errorf("displayAssetNodes err: %s", err)
 	}
 }

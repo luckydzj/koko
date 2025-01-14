@@ -3,9 +3,11 @@ package httpd
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LeeEirc/elfinder"
@@ -23,28 +25,29 @@ import (
 
 const (
 	defaultBufferSize = 1024
+	WebsocketErrorf   = "Websocket upgrade err: %s"
 )
 
 var upGrader = websocket.Upgrader{
 	ReadBufferSize:  defaultBufferSize,
 	WriteBufferSize: defaultBufferSize,
 	Subprotocols:    []string{"JMS-KOKO"},
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 func NewServer(jmsService *service.JMService) *Server {
-	return &Server{
-		broadCaster: NewBroadcaster(),
-		JmsService:  jmsService,
-	}
+	srv := &Server{broadCaster: NewBroadcaster(), apiClient: jmsService}
+	eng := createRouter(jmsService, srv)
+	conf := config.GetConf()
+	addr := net.JoinHostPort(conf.BindHost, conf.HTTPPort)
+	srv.Srv = &http.Server{Addr: addr, Handler: eng}
+	return srv
 }
 
 type Server struct {
 	broadCaster *broadcaster
 	Srv         *http.Server
-	JmsService  *service.JMService
+	apiClient   *service.JMService
 }
 
 func (s *Server) Start() {
@@ -62,23 +65,23 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) SftpHostConnectorView(ctx *gin.Context) {
-	var sid string
+	var params struct {
+		Sid string `form:"sid"`
+	}
 	switch ctx.Request.Method {
-	case http.MethodGet:
-		sid = ctx.Query("sid")
-	case http.MethodPost:
-		sid = ctx.PostForm("sid")
+	case http.MethodGet, http.MethodPost:
+		if err := ctx.ShouldBind(&params); err != nil {
+			logger.Errorf("Invalid elfinder request url %s from ip %s",
+				ctx.Request.URL, ctx.ClientIP())
+			ctx.String(http.StatusBadRequest, "invalid elfinder request")
+			return
+		}
 	default:
 		ctx.AbortWithStatus(http.StatusMethodNotAllowed)
 		return
 	}
-	if sid == "" {
-		logger.Errorf("Invalid elfinder request url %s from ip %s", ctx.Request.URL, ctx.ClientIP())
-		ctx.String(http.StatusBadRequest, "invalid elfinder request")
-		return
-	}
 	var userV *UserVolume
-	if wsCon := s.broadCaster.GetUserWebsocket(sid); wsCon != nil {
+	if wsCon := s.broadCaster.GetUserWebsocket(params.Sid); wsCon != nil {
 		handler := wsCon.GetHandler()
 		switch handler.Name() {
 		case WebFolderName:
@@ -87,11 +90,11 @@ func (s *Server) SftpHostConnectorView(ctx *gin.Context) {
 	}
 	if userV == nil {
 		logger.Errorf("Ws(%s) already closed request url %s from ip %s",
-			sid, ctx.Request.URL, ctx.ClientIP())
+			params.Sid, ctx.Request.URL, ctx.ClientIP())
 		ctx.String(http.StatusBadRequest, "ws already disconnected")
 		return
 	}
-	logger.Infof("Elfinder %s connected again.", sid)
+	logger.Infof("Elfinder ws %s connected again.", params.Sid)
 	conf := config.GetConf()
 	maxSize := common.ConvertSizeToBytes(conf.ZipMaxSize)
 	options := map[string]string{
@@ -103,177 +106,142 @@ func (s *Server) SftpHostConnectorView(ctx *gin.Context) {
 }
 
 func (s *Server) ProcessTerminalWebsocket(ctx *gin.Context) {
-	var targetParams struct {
-		TargetType string `form:"type"`
-		TargetId   string `form:"target_id"`
-	}
-	if err := ctx.ShouldBind(&targetParams); err != nil {
-		logger.Errorf("Ws miss required params( type|target_id ) err: %s", err)
-		ctx.AbortWithStatus(http.StatusBadRequest)
+	userConn, err := s.UpgradeUserWsConn(ctx)
+	if err != nil {
+		logger.Errorf(WebsocketErrorf, err)
 		return
 	}
-	userValue, ok := ctx.Get(auth.ContextKeyUser)
-	if !ok {
-		logger.Errorf("Ws has no valid user from ip %s", ctx.ClientIP())
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-	currentUser := userValue.(*model.User)
-	systemUserId, _ := ctx.GetQuery("system_user_id")
-	s.runTTY(ctx, currentUser, targetParams.TargetType, targetParams.TargetId, systemUserId)
-}
-
-func (s *Server) ProcessTokenWebsocket(ctx *gin.Context) {
-	var targetParams struct {
-		TargetId string `form:"target_id"`
-	}
-	if err := ctx.ShouldBind(&targetParams); err != nil {
-		logger.Errorf("Ws miss required params(target_id ) err: %s", err)
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-	tokenUser, err := s.JmsService.GetTokenAsset(targetParams.TargetId)
-	if err != nil || tokenUser.UserID == "" {
-		logger.Errorf("Token is invalid: %s", targetParams.TargetId)
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-	currentUser, err := s.JmsService.GetUserById(tokenUser.UserID)
-	if err != nil || currentUser == nil {
-		logger.Errorf("Token userID is invalid: %s", tokenUser.UserID)
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-	var targetId string
-	switch tokenUser.Type {
-	case model.ConnectApplication:
-		targetId = strings.ToLower(tokenUser.ApplicationID)
-	case model.ConnectAsset:
-		targetId = tokenUser.AssetID
-	default:
-		targetId = tokenUser.AssetID
-	}
-	targetType := TargetTypeAsset
-	systemUserId := tokenUser.SystemUserID
-	s.runTTY(ctx, currentUser, targetType, targetId, systemUserId)
+	s.runTTY(userConn)
 }
 
 func (s *Server) ProcessElfinderWebsocket(ctx *gin.Context) {
-	var (
-		userValue   interface{}
-		currentUser *model.User
-		targetId    string
-		ok          bool
-	)
-	if userValue, ok = ctx.Get(auth.ContextKeyUser); !ok {
-		logger.Errorf("Ws has no valid user from ip %s", ctx.ClientIP())
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-	currentUser = userValue.(*model.User)
-	if targetId, ok = ctx.GetQuery("target_id"); !ok {
-		logger.Error("Ws miss required params (target_id).")
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-	wsSocket, err := s.Upgrade(ctx)
+	userConn, err := s.UpgradeUserWsConn(ctx)
 	if err != nil {
-		logger.Errorf("Websocket upgrade err: %s", err)
-		ctx.String(http.StatusBadRequest, "Websocket upgrade err %s", err)
+		logger.Errorf(WebsocketErrorf, err)
 		return
 	}
-	defer wsSocket.Close()
-	setting := s.getPublicSetting()
-	userConn := UserWebsocket{
-		Uuid:           common.UUID(),
-		webSrv:         s,
-		conn:           wsSocket,
-		ctx:            ctx.Copy(),
-		messageChannel: make(chan *Message, 10),
-		user:           currentUser,
-		setting:        &setting,
-	}
-
 	userConn.handler = &webFolder{
-		ws:         &userConn,
-		targetId:   targetId,
-		done:       make(chan struct{}),
-		jmsService: s.JmsService,
+		ws:   userConn,
+		done: make(chan struct{}),
 	}
-
-	s.broadCaster.EnterUserWebsocket(&userConn)
-	defer s.broadCaster.LeaveUserWebsocket(&userConn)
+	s.broadCaster.EnterUserWebsocket(userConn)
+	defer s.broadCaster.LeaveUserWebsocket(userConn)
 	userConn.Run()
 }
 
-func (s *Server) Upgrade(ctx *gin.Context) (*ws.Socket, error) {
+func (s *Server) ChatAIWebsocket(ctx *gin.Context) {
+	userConn, err := s.UpgradeUserWsConn(ctx)
+	if err != nil {
+		logger.Errorf(WebsocketErrorf, err)
+		return
+	}
+
+	termConf, err := userConn.apiClient.GetTerminalConfig()
+	if err != nil {
+		logger.Errorf("Get terminal config failed: %s", err)
+		return
+	}
+
+	userConn.handler = &chat{
+		ws:              userConn,
+		conversationMap: sync.Map{},
+		termConf:        &termConf,
+	}
+	s.broadCaster.EnterUserWebsocket(userConn)
+	defer s.broadCaster.LeaveUserWebsocket(userConn)
+	userConn.Run()
+}
+
+func (s *Server) UpgradeUserWsConn(ctx *gin.Context) (*UserWebsocket, error) {
 	underWsCon, err := upGrader.Upgrade(ctx.Writer, ctx.Request, ctx.Writer.Header())
 	if err != nil {
 		return nil, err
 	}
 	wsSocket := ws.NewSocket(underWsCon, ctx.Request)
+
+	apiClient := s.apiClient.Copy()
+	langCode := config.GetConf().LanguageCode
+	if acceptLang := ctx.GetHeader("Accept-Language"); acceptLang != "" {
+		apiClient.SetHeader("Accept-Language", acceptLang)
+		langCode = ParseAcceptLanguageCode(acceptLang)
+	}
+	if cookieLang, err2 := ctx.Cookie("django_language"); err2 == nil {
+		apiClient.SetCookie("django_language", cookieLang)
+		langCode = cookieLang
+	}
+
 	//设置 websocket 协议层面对应的ping和pong 处理方法
 	underWsCon.SetPingHandler(func(appData string) error {
+		logger.Debugf("Websocket ping %s", appData)
 		return wsSocket.WritePong([]byte(appData), maxWriteTimeOut)
 	})
 	underWsCon.SetPongHandler(func(appData string) error {
+		logger.Debugf("Websocket pong %s", appData)
 		return wsSocket.WritePing([]byte(appData), maxWriteTimeOut)
 	})
-	return wsSocket, nil
-}
 
-func (s *Server) runTTY(ctx *gin.Context, currentUser *model.User,
-	targetType, targetId, SystemUserID string) {
-	wsSocket, err := s.Upgrade(ctx)
-	if err != nil {
-		logger.Errorf("Websocket upgrade err: %s", err)
-		ctx.String(http.StatusBadRequest, "Websocket upgrade err %s", err)
-		return
-	}
-	defer wsSocket.Close()
+	userValue := ctx.MustGet(auth.ContextKeyUser)
+	currentUser := userValue.(*model.User)
 	setting := s.getPublicSetting()
-	userConn := UserWebsocket{
+	userConn := &UserWebsocket{
 		Uuid:           common.UUID(),
-		webSrv:         s,
 		conn:           wsSocket,
 		ctx:            ctx.Copy(),
 		messageChannel: make(chan *Message, 10),
 		user:           currentUser,
 		setting:        &setting,
+		apiClient:      apiClient,
+		langCode:       langCode,
 	}
-	userConn.handler = &tty{
-		ws:           &userConn,
-		targetType:   targetType,
-		targetId:     targetId,
-		systemUserId: SystemUserID,
-		jmsService:   s.JmsService,
-		extraParams:  ctx.Request.Form,
+	return userConn, nil
+}
+
+func (s *Server) runTTY(userConn *UserWebsocket) {
+	ttyHandler := &tty{
+		ws: userConn,
 	}
-	s.broadCaster.EnterUserWebsocket(&userConn)
-	defer s.broadCaster.LeaveUserWebsocket(&userConn)
+	userConn.handler = ttyHandler
+	s.broadCaster.EnterUserWebsocket(userConn)
+	defer s.broadCaster.LeaveUserWebsocket(userConn)
 	userConn.Run()
 }
 
+var upTime = time.Now()
+
 func (s *Server) HealthStatusHandler(ctx *gin.Context) {
 	status := make(map[string]interface{})
-	status["timestamp"] = time.Now().UTC()
+	now := time.Now()
+	status["timestamp"] = now.UTC()
+	status["uptime"] = now.Sub(upTime).String()
 	ctx.JSON(http.StatusOK, status)
 }
 
 func (s *Server) GenerateViewMeta(targetId string) (meta ViewPageMata) {
 	meta.ID = targetId
-	setting, err := s.JmsService.GetPublicSetting()
+	setting, err := s.apiClient.GetPublicSetting()
 	if err != nil {
 		logger.Errorf("Get core api public setting err: %s", err)
 	}
-	meta.IconURL = setting.LogoURLS.Favicon
+	meta.IconURL = setting.Interface.Favicon
 	return
 }
 
 func (s *Server) getPublicSetting() model.PublicSetting {
-	setting, err := s.JmsService.GetPublicSetting()
+	setting, err := s.apiClient.GetPublicSetting()
 	if err != nil {
 		logger.Errorf("Get Public setting err: %s", err)
 	}
 	return setting
+}
+
+func ParseAcceptLanguageCode(language string) string {
+	// en,zh-TW;q=0.9,zh-CN;q=0.8,zh;q=0.7
+	// 解析出第一个语言代码
+	if language == "" {
+		return "zh-CN"
+	}
+	languages := strings.SplitN(language, ";", 2)
+	lang := strings.TrimSpace(languages[0])
+	languages = strings.SplitN(lang, ",", 2)
+	return languages[0]
 }

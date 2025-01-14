@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
@@ -16,7 +17,7 @@ const (
 type commandConfirmStatus struct {
 	Status string
 	data   string
-	Rule   model.FilterRule
+	Rule   CommandRule
 	Cmd    string
 	sync.Mutex
 	wg sync.WaitGroup
@@ -24,7 +25,7 @@ type commandConfirmStatus struct {
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
-	action    model.RuleAction
+	action    model.CommandAction
 	Processor string
 }
 
@@ -34,13 +35,13 @@ func (c *commandConfirmStatus) SetStatus(status string) {
 	c.Status = status
 }
 
-func (c *commandConfirmStatus) SetAction(action model.RuleAction) {
+func (c *commandConfirmStatus) SetAction(action model.CommandAction) {
 	c.Lock()
 	defer c.Unlock()
 	c.action = action
 }
 
-func (c *commandConfirmStatus) GetAction() model.RuleAction {
+func (c *commandConfirmStatus) GetAction() model.CommandAction {
 	c.Lock()
 	defer c.Unlock()
 	return c.action
@@ -58,7 +59,7 @@ func (c *commandConfirmStatus) GetProcessor() string {
 	return c.Processor
 }
 
-func (c *commandConfirmStatus) SetRule(rule model.FilterRule) {
+func (c *commandConfirmStatus) SetRule(rule CommandRule) {
 	c.Lock()
 	defer c.Unlock()
 	c.Rule = rule
@@ -118,3 +119,9 @@ const (
 	CtrlC = 3
 	CtrlD = 4
 )
+
+func stripNewLine(cmd string) string {
+	cmd = strings.ReplaceAll(cmd, "\r", "")
+	cmd = strings.ReplaceAll(cmd, "\n", "")
+	return cmd
+}

@@ -1,10 +1,13 @@
 package koko
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/jumpserver/koko/pkg/config"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/common"
@@ -12,6 +15,7 @@ import (
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/jumpserver/koko/pkg/proxy"
+	"github.com/jumpserver/koko/pkg/session"
 )
 
 // uploadRemainReplay 上传遗留的录像
@@ -39,6 +43,20 @@ func uploadRemainReplay(jmsService *service.JMService) {
 		return nil
 	})
 
+	recordLifecycleLog := func(id string, event model.LifecycleEvent, reason string) {
+		logObj := model.SessionLifecycleLog{Reason: reason}
+		if err1 := jmsService.RecordSessionLifecycleLog(id, event, logObj); err1 != nil {
+			logger.Errorf("Update session %s activity log failed: %s", id, err1)
+		}
+	}
+	if len(allRemainFiles) == 0 {
+		logger.Info("No remain replay file to upload")
+		return
+	}
+
+	logger.Infof("Start upload remain %d replay files 10 min later ", len(allRemainFiles))
+	time.Sleep(10 * time.Minute)
+
 	for absPath, remainReplay := range allRemainFiles {
 		absGzPath := absPath
 		if !remainReplay.IsGzip {
@@ -60,14 +78,23 @@ func uploadRemainReplay(jmsService *service.JMService) {
 			}
 			_ = os.Remove(absPath)
 		}
-		Target, _ := filepath.Rel(replayDir, absGzPath)
+		target, _ := filepath.Rel(replayDir, absGzPath)
+
+		recordLifecycleLog(remainReplay.Id, model.ReplayUploadStart, "")
 		logger.Infof("Upload replay file: %s, type: %s", absGzPath, replayStorage.TypeName())
-		if err2 := replayStorage.Upload(absGzPath, Target); err2 != nil {
+		if err2 := replayStorage.Upload(absGzPath, target); err2 != nil {
 			logger.Errorf("Upload remain replay file %s failed: %s", absGzPath, err2)
+			reason := model.SessionReplayErrUploadFailed
+			if err3 := jmsService.SessionReplayFailed(remainReplay.Id, reason); err3 != nil {
+				logger.Errorf("Update session %s status %s failed: %s", remainReplay.Id, reason, err3)
+			}
+			failureMsg := strings.ReplaceAll(err2.Error(), ",", " ")
+			recordLifecycleLog(remainReplay.Id, model.ReplayUploadFailure, failureMsg)
 			continue
 		}
-		if err := jmsService.FinishReply(remainReplay.Id); err != nil {
-			logger.Errorf("Notify session %s upload failed: %s", remainReplay.Id, err)
+		recordLifecycleLog(remainReplay.Id, model.ReplayUploadSuccess, "")
+		if err1 := jmsService.FinishReply(remainReplay.Id); err1 != nil {
+			logger.Errorf("Notify session %s upload failed: %s", remainReplay.Id, err1)
 			continue
 		}
 		_ = os.Remove(absGzPath)
@@ -76,37 +103,151 @@ func uploadRemainReplay(jmsService *service.JMService) {
 	logger.Info("Upload remain replay done")
 }
 
-// keepHeartbeat 保持心跳
-func keepHeartbeat(jmsService *service.JMService) {
-	for {
-		time.Sleep(30 * time.Second)
-		data := proxy.GetAliveSessions()
-		tasks, err := jmsService.TerminalHeartBeat(data)
-		if err != nil {
-			logger.Error(err)
+// uploadRemainFTPFile 上传遗留的上传下载文件
+func uploadRemainFTPFile(jmsService *service.JMService) {
+	ftpFileDir := config.GetConf().FTPFileFolderPath
+	conf, err := jmsService.GetTerminalConfig()
+	if err != nil {
+		logger.Error(err)
+		return
+	}
+	ftpFileStorage := proxy.NewFTPFileStorage(jmsService, &conf)
+	allRemainFiles := make(map[string]RemainFTPFile)
+	_ = filepath.Walk(ftpFileDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if ftpFileInfo, ok := parseFTPFilename(info.Name()); ok {
+			allRemainFiles[path] = ftpFileInfo
+		}
+		return nil
+	})
+	if len(allRemainFiles) == 0 {
+		logger.Info("No remain ftp file to upload")
+		return
+	}
+	logger.Infof("Start upload remain %d ftp files 10 min later ", len(allRemainFiles))
+	time.Sleep(10 * time.Minute)
+
+	for absPath, remainFTPFile := range allRemainFiles {
+		absGzPath := absPath
+		dateTarget, _ := filepath.Rel(ftpFileDir, absGzPath)
+		targetName := strings.Join([]string{proxy.FtpTargetPrefix, dateTarget}, "/")
+		logger.Infof("Upload FTP file: %s, target: %s, type: %s", absGzPath,
+			targetName, ftpFileStorage.TypeName())
+		if err = ftpFileStorage.Upload(absGzPath, targetName); err != nil {
+			logger.Errorf("Upload remain FTP file %s failed: %s", absGzPath, err)
 			continue
 		}
-		if len(tasks) != 0 {
-			for _, task := range tasks {
-				switch task.Name {
-				case TaskKillSession:
-					if sw, ok := proxy.GetSessionById(task.Args); ok {
-						sw.Terminate(task.Kwargs.TerminatedBy)
-						if err = jmsService.FinishTask(task.ID); err != nil {
-							logger.Error(err)
-						}
-					}
-				default:
+		if err := jmsService.FinishFTPFile(remainFTPFile.Id); err != nil {
+			logger.Errorf("Notify FTP file %s upload failed: %s", remainFTPFile.Id, err)
+			continue
+		}
+		_ = os.Remove(absGzPath)
+		logger.Infof("Upload remain FTP file %s success", absGzPath)
+	}
+	logger.Info("Upload remain FTP file done")
+}
 
-				}
+// keepHeartbeat 保持心跳
+func keepHeartbeat(jmsService *service.JMService) {
+	KeepWsHeartbeat(jmsService)
+}
+
+func handleTerminalTask(jmsService *service.JMService, tasks []model.TerminalTask) {
+	for _, task := range tasks {
+		sess, ok := session.GetSessionById(task.Args)
+		if !ok {
+			logger.Infof("Task %s session %s not found", task.ID, task.Args)
+			continue
+		}
+		logger.Infof("Handle task %s for session %s", task.Name, task.Args)
+		if err := sess.HandleTask(&task); err != nil {
+			logger.Errorf("Handle task %s failed: %s", task.Name, err)
+			continue
+		}
+		if err := jmsService.FinishTask(task.ID); err != nil {
+			logger.Errorf("Finish task %s failed: %s", task.ID, err)
+			continue
+		}
+		logger.Infof("Handle task %s for session %s success", task.Name, task.Args)
+
+	}
+}
+
+func KeepWsHeartbeat(jmsService *service.JMService) {
+	ws, err := jmsService.GetWsClient()
+	if err != nil {
+		logger.Errorf("Start ws client failed: %s", err)
+		time.Sleep(10 * time.Second)
+		go KeepWsHeartbeat(jmsService)
+		return
+	}
+	logger.Info("Start ws client success")
+	done := make(chan struct{}, 2)
+	go func() {
+		defer close(done)
+		for {
+			msgType, message, err2 := ws.ReadMessage()
+			if err2 != nil {
+				logger.Errorf("Ws client read err: %s", err2)
+				return
 			}
+			switch msgType {
+			case websocket.PingMessage,
+				websocket.PongMessage:
+				logger.Debug("Ws client ping/pong Message")
+				continue
+			case websocket.CloseMessage:
+				logger.Debug("Ws client close Message")
+				return
+			}
+			var tasks []model.TerminalTask
+			if err = json.Unmarshal(message, &tasks); err != nil {
+				logger.Errorf("Ws client Unmarshal failed: %s", err)
+				continue
+			}
+			if len(tasks) != 0 {
+				handleTerminalTask(jmsService, tasks)
+			}
+		}
+	}()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	if err1 := ws.WriteJSON(GetStatusData()); err1 != nil {
+		logger.Errorf("Ws client send heartbeat data failed: %s", err1)
+	}
+	for {
+		select {
+		case <-done:
+			logger.Info("Ws client closed")
+			time.Sleep(10 * time.Second)
+			go KeepWsHeartbeat(jmsService)
+			return
+		case <-ticker.C:
+			if err1 := ws.WriteJSON(GetStatusData()); err1 != nil {
+				logger.Errorf("Ws client write stat data failed: %s", err1)
+				continue
+			}
+			logger.Debug("Ws client send heartbeat success")
 		}
 	}
 }
 
-const (
-	TaskKillSession = "kill_session"
-)
+func GetStatusData() interface{} {
+	ids := session.GetAliveSessionIds()
+	payload := model.HeartbeatData{
+		SessionOnlineIds: ids,
+		CpuUsed:          common.CpuLoad1Usage(),
+		MemoryUsed:       common.MemoryUsagePercent(),
+		DiskUsed:         common.DiskUsagePercent(),
+		SessionOnline:    len(ids),
+	}
+	return map[string]interface{}{
+		"type":    "status",
+		"payload": payload,
+	}
+}
 
 func ValidateRemainReplayFile(path string) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, os.ModePerm)
@@ -140,6 +281,10 @@ type RemainReplay struct {
 	Version model.ReplayVersion
 }
 
+type RemainFTPFile struct {
+	Id string // FTP log id
+}
+
 func parseReplayFilename(filename string) (replay RemainReplay, ok bool) {
 	// 未压缩的旧录像文件名格式是一个 UUID
 	if len(filename) == 36 {
@@ -150,6 +295,15 @@ func parseReplayFilename(filename string) (replay RemainReplay, ok bool) {
 	}
 	if replay.Id, replay.Version, ok = isReplayFile(filename); ok {
 		replay.IsGzip = isGzipFile(filename)
+	}
+	return
+}
+
+func parseFTPFilename(filename string) (ftpFile RemainFTPFile, ok bool) {
+	if len(filename) == 36 {
+		ftpFile.Id = filename
+		ok = true
+		return
 	}
 	return
 }

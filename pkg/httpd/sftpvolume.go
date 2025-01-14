@@ -12,42 +12,94 @@ import (
 	"github.com/LeeEirc/elfinder"
 	"github.com/pkg/sftp"
 
+	"github.com/jumpserver/koko/pkg/common"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 	"github.com/jumpserver/koko/pkg/logger"
+	"github.com/jumpserver/koko/pkg/proxy"
 	"github.com/jumpserver/koko/pkg/srvconn"
 )
 
-func NewUserVolume(jmsService *service.JMService, user *model.User, addr, hostId string) *UserVolume {
+type volumeOption struct {
+	addr         string
+	user         *model.User
+	asset        *model.PermAsset
+	connectToken *model.ConnectToken
+	terminalCfg  *model.TerminalConfig
+}
+type VolumeOption func(*volumeOption)
+
+func WithUser(user *model.User) VolumeOption {
+	return func(opts *volumeOption) {
+		opts.user = user
+	}
+}
+
+func WithAddr(addr string) VolumeOption {
+	return func(opts *volumeOption) {
+		opts.addr = addr
+	}
+}
+
+func WithAsset(asset *model.PermAsset) VolumeOption {
+	return func(opts *volumeOption) {
+		opts.asset = asset
+	}
+}
+
+func WithConnectToken(connectToken *model.ConnectToken) VolumeOption {
+	return func(opts *volumeOption) {
+		opts.connectToken = connectToken
+	}
+}
+
+func WithTerminalCfg(cfg *model.TerminalConfig) VolumeOption {
+	return func(opts *volumeOption) {
+		opts.terminalCfg = cfg
+	}
+
+}
+
+func NewUserVolume(jmsService *service.JMService, opts ...VolumeOption) *UserVolume {
+	var volOpts volumeOption
+	for _, opt := range opts {
+		opt(&volOpts)
+	}
 	homeName := "Home"
 	basePath := "/"
-	var (
-		assets []model.Asset
-		err    error
-	)
-	if hostId != "" {
-		assets, err = jmsService.GetUserAssetByID(user.ID, hostId)
-		if err != nil {
-			logger.Errorf("Get user asset failed: %s", err)
+	asset := volOpts.asset
+	if asset != nil {
+		folderName := asset.Name
+		if strings.Contains(folderName, "/") {
+			folderName = strings.ReplaceAll(folderName, "/", "_")
 		}
-		if len(assets) == 1 {
-			folderName := assets[0].Hostname
-			if strings.Contains(folderName, "/") {
-				folderName = strings.ReplaceAll(folderName, "/", "_")
-			}
-			homeName = folderName
-			basePath = filepath.Join("/", homeName)
-		}
+		homeName = folderName
+		basePath = filepath.Join("/", homeName)
 	}
-	userSftp := srvconn.NewUserSftpConn(jmsService, user, addr, assets, nil)
-	rawID := fmt.Sprintf("%s@%s", user.Username, addr)
+	sftpOpts := make([]srvconn.UserSftpOption, 0, 5)
+	if volOpts.connectToken != nil {
+		sftpOpts = append(sftpOpts, srvconn.WithConnectToken(volOpts.connectToken))
+	}
+	if volOpts.asset != nil {
+		sftpOpts = append(sftpOpts, srvconn.WithAssets([]model.PermAsset{*volOpts.asset}))
+	}
+	sftpOpts = append(sftpOpts, srvconn.WithUser(volOpts.user))
+	sftpOpts = append(sftpOpts, srvconn.WithRemoteAddr(volOpts.addr))
+	sftpOpts = append(sftpOpts, srvconn.WithLoginFrom(model.LoginFromWeb))
+	sftpOpts = append(sftpOpts, srvconn.WithTerminalCfg(volOpts.terminalCfg))
+	userSftp := srvconn.NewUserSftpConn(jmsService, sftpOpts...)
+	rawID := fmt.Sprintf("%s@%s", volOpts.user.Username, volOpts.addr)
+
+	recorder := proxy.GetFTPFileRecorder(jmsService)
 	uVolume := &UserVolume{
 		Uuid:          elfinder.GenerateID(rawID),
 		UserSftp:      userSftp,
-		Homename:      homeName,
+		HomeName:      homeName,
 		basePath:      basePath,
 		chunkFilesMap: make(map[int]*sftp.File),
 		lock:          new(sync.Mutex),
+		recorder:      recorder,
+		ftpLogMap:     make(map[int]*model.FTPLog),
 	}
 	return uVolume
 }
@@ -55,11 +107,14 @@ func NewUserVolume(jmsService *service.JMService, user *model.User, addr, hostId
 type UserVolume struct {
 	Uuid     string
 	UserSftp *srvconn.UserSftpConn
-	Homename string
+	HomeName string
 	basePath string
 
 	chunkFilesMap map[int]*sftp.File
+	ftpLogMap     map[int]*model.FTPLog
 	lock          *sync.Mutex
+
+	recorder *proxy.FTPFileRecorder
 }
 
 func (u *UserVolume) ID() string {
@@ -143,6 +198,20 @@ func (u *UserVolume) Parents(path string, dep int) []elfinder.FileDir {
 		}
 
 		for i := 0; i < len(tmps); i++ {
+			if tmps[i].Mode()&os.ModeSymlink != 0 {
+				linkInfo := NewElfinderFileInfo(u.Uuid, dirPath, tmps[i])
+				_, err2 := u.UserSftp.ReadDir(filepath.Join(u.basePath, dirPath, tmps[i].Name()))
+				if err2 != nil {
+					logger.Errorf("link file %s is not dir err: %s", tmps[i].Name(), err2)
+				} else {
+					logger.Infof("link file %s is dir", tmps[i].Name())
+					linkInfo.Mime = "directory"
+					linkInfo.Dirs = 1
+				}
+				dirs = append(dirs, linkInfo)
+				continue
+			}
+
 			dirs = append(dirs, NewElfinderFileInfo(u.Uuid, dirPath, tmps[i]))
 		}
 
@@ -154,17 +223,29 @@ func (u *UserVolume) Parents(path string, dep int) []elfinder.FileDir {
 	return dirs
 }
 
-func (u *UserVolume) GetFile(path string) (reader io.ReadCloser, err error) {
+func (u *UserVolume) GetFile(path string) (fileData elfinder.FileData, err error) {
 	logger.Debug("GetFile path: ", path)
-	sftpFile, err := u.UserSftp.Open(filepath.Join(u.basePath, TrimPrefix(path)))
+	var rest elfinder.FileData
+	sf, err := u.UserSftp.Open(filepath.Join(u.basePath, TrimPrefix(path)))
 	if err != nil {
-		return nil, err
+		return rest, err
 	}
+
+	fileInfo, err := sf.Stat()
+	if err != nil {
+		return rest, err
+	}
+
+	if err1 := u.recorder.ChunkedRecord(sf.FTPLog, sf, 0, fileInfo.Size()); err1 != nil {
+		logger.Errorf("Record file err: %s", err1)
+	}
+	_, _ = sf.Seek(0, io.SeekStart)
 	// 屏蔽 sftp*File 的 WriteTo 方法，防止调用 sftp stat 命令
-	return &fileReader{sftpFile}, nil
+	fileData = elfinder.FileData{Reader: sf, Size: fileInfo.Size()}
+	return fileData, nil
 }
 
-func (u *UserVolume) UploadFile(dirPath, uploadPath, filename string, reader io.Reader) (elfinder.FileDir, error) {
+func (u *UserVolume) UploadFile(dirPath, uploadPath, filename string, reader io.Reader, totalSize int64) (elfinder.FileDir, error) {
 	var path string
 	switch {
 	case strings.Contains(uploadPath, filename):
@@ -175,7 +256,7 @@ func (u *UserVolume) UploadFile(dirPath, uploadPath, filename string, reader io.
 		path = filepath.Join(dirPath, filename)
 
 	}
-	logger.Debug("Volume upload file path: ", path, " ", filename, " ", uploadPath)
+	logger.Debug("Volume upload file path: ", path, "|", filename, "|", uploadPath)
 	var rest elfinder.FileDir
 	fd, err := u.UserSftp.Create(filepath.Join(u.basePath, path))
 	if err != nil {
@@ -183,11 +264,20 @@ func (u *UserVolume) UploadFile(dirPath, uploadPath, filename string, reader io.
 	}
 	defer fd.Close()
 
-	_, err = io.Copy(fd, reader)
+	readerAt, ok := reader.(io.ReaderAt)
+	if !ok {
+		return rest, fmt.Errorf("the provided reader does not implement io.ReaderAt")
+	}
+
+	if err1 := u.recorder.ChunkedRecord(fd.FTPLog, readerAt, 0, totalSize); err1 != nil {
+		logger.Errorf("Record file err: %s", err1)
+	}
+
+	err = common.ChunkedFileTransfer(fd, readerAt, 0, totalSize)
 	if err != nil {
 		return rest, err
 	}
-	return u.Info(path)
+	return u.Info(filepath.Join(filepath.Dir(path), filepath.Base(fd.FTPLog.Path)))
 }
 
 func (u *UserVolume) UploadChunk(cid int, dirPath, uploadPath, filename string, rangeData elfinder.ChunkRange, reader io.Reader) error {
@@ -195,6 +285,7 @@ func (u *UserVolume) UploadChunk(cid int, dirPath, uploadPath, filename string, 
 	var path string
 	u.lock.Lock()
 	fd, ok := u.chunkFilesMap[cid]
+	ftpLog := u.ftpLogMap[cid]
 	u.lock.Unlock()
 	if !ok {
 		switch {
@@ -206,23 +297,40 @@ func (u *UserVolume) UploadChunk(cid int, dirPath, uploadPath, filename string, 
 			path = filepath.Join(dirPath, filename)
 
 		}
-		fd, err = u.UserSftp.Create(filepath.Join(u.basePath, path))
+		f, err := u.UserSftp.Create(filepath.Join(u.basePath, path))
 		if err != nil {
 			return err
 		}
+		fd = f.File
+		ftpLog = f.FTPLog
 		_, err = fd.Seek(rangeData.Offset, 0)
 		if err != nil {
 			return err
 		}
 		u.lock.Lock()
 		u.chunkFilesMap[cid] = fd
+		u.ftpLogMap[cid] = ftpLog
 		u.lock.Unlock()
 	}
-	_, err = io.Copy(fd, reader)
+
+	fileSize := rangeData.Length
+	offset := rangeData.Offset
+	readerAt, ok := reader.(io.ReaderAt)
+	if !ok {
+		return fmt.Errorf("the provided reader does not implement io.ReaderAt")
+	}
+
+	if err2 := u.recorder.ChunkedRecord(ftpLog, readerAt, offset, fileSize); err2 != nil {
+		logger.Errorf("Record file err: %s", err2)
+	}
+
+	err = common.ChunkedFileTransfer(fd, readerAt, offset, fileSize)
+
 	if err != nil {
 		_ = fd.Close()
 		u.lock.Lock()
 		delete(u.chunkFilesMap, cid)
+		delete(u.ftpLogMap, cid)
 		u.lock.Unlock()
 	}
 	return err
@@ -243,7 +351,10 @@ func (u *UserVolume) MergeChunk(cid, total int, dirPath, uploadPath, filename st
 	u.lock.Lock()
 	if fd, ok := u.chunkFilesMap[cid]; ok {
 		_ = fd.Close()
+		ftpLog := u.ftpLogMap[cid]
 		delete(u.chunkFilesMap, cid)
+		u.recorder.FinishFTPFile(ftpLog.ID)
+		delete(u.ftpLogMap, cid)
 	}
 	u.lock.Unlock()
 	return u.Info(path)
@@ -266,9 +377,21 @@ func (u *UserVolume) MakeFile(dir, newFilename string) (elfinder.FileDir, error)
 	path := filepath.Join(dir, newFilename)
 	var rest elfinder.FileDir
 	fd, err := u.UserSftp.Create(filepath.Join(u.basePath, path))
+
 	if err != nil {
 		return rest, err
 	}
+
+	fileInfo, err := fd.Stat()
+	if err != nil {
+		return rest, err
+	}
+
+	if err1 := u.recorder.ChunkedRecord(fd.FTPLog, fd, 0, fileInfo.Size()); err1 != nil {
+		logger.Errorf("Record file err: %s", err1)
+	}
+
+	_, _ = fd.Seek(0, io.SeekStart)
 	_ = fd.Close()
 	res, err := u.UserSftp.Stat(filepath.Join(u.basePath, path))
 
@@ -302,7 +425,9 @@ func (u *UserVolume) Remove(path string) error {
 	return u.UserSftp.Remove(filepath.Join(u.basePath, path))
 }
 
-func (u *UserVolume) Paste(dir, filename, suffix string, reader io.ReadCloser) (elfinder.FileDir, error) {
+func (u *UserVolume) Paste(dir, filename, suffix string, fileData elfinder.FileData) (elfinder.FileDir, error) {
+	reader := fileData.Reader
+	totalSize := fileData.Size
 	defer reader.Close()
 	var rest elfinder.FileDir
 	path := filepath.Join(dir, filename)
@@ -316,7 +441,13 @@ func (u *UserVolume) Paste(dir, filename, suffix string, reader io.ReadCloser) (
 		return rest, err
 	}
 	defer fd.Close()
-	_, err = io.Copy(fd, reader)
+
+	readerAt, ok := reader.(io.ReaderAt)
+	if !ok {
+		return rest, fmt.Errorf("the provided reader does not implement io.ReaderAt")
+	}
+
+	err = common.ChunkedFileTransfer(fd, readerAt, 0, totalSize)
 	if err != nil {
 		return rest, err
 	}
@@ -337,7 +468,7 @@ func (u *UserVolume) RootFileDir() elfinder.FileDir {
 		readPem, writePem = elfinder.ReadWritePem(fInfo.Mode())
 	}
 	var rest elfinder.FileDir
-	rest.Name = u.Homename
+	rest.Name = u.HomeName
 	rest.Hash = hashPath(u.Uuid, "/")
 	rest.Size = size
 	rest.Volumeid = u.Uuid
@@ -396,20 +527,4 @@ func hashPath(id, path string) string {
 
 func TrimPrefix(path string) string {
 	return strings.TrimPrefix(path, "/")
-}
-
-var (
-	_ io.ReadCloser = (*fileReader)(nil)
-)
-
-type fileReader struct {
-	read io.ReadCloser
-}
-
-func (f *fileReader) Read(p []byte) (nr int, err error) {
-	return f.read.Read(p)
-}
-
-func (f *fileReader) Close() error {
-	return f.read.Close()
 }

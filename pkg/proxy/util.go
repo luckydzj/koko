@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
@@ -12,9 +13,17 @@ type StorageType interface {
 	TypeName() string
 }
 
-type ReplayStorage interface {
+type Storage interface {
 	Upload(gZipFile, target string) error
 	StorageType
+}
+
+type ReplayStorage interface {
+	Storage
+}
+
+type FTPFileStorage interface {
+	Storage
 }
 
 type CommandStorage interface {
@@ -22,7 +31,7 @@ type CommandStorage interface {
 	StorageType
 }
 
-func NewReplayStorage(jmsService *service.JMService, conf *model.TerminalConfig) ReplayStorage {
+func GetStorage(conf *model.TerminalConfig) Storage {
 	cfg := conf.ReplayStorage
 	switch cfg.TypeName {
 	case "azure":
@@ -80,10 +89,7 @@ func NewReplayStorage(jmsService *service.JMService, conf *model.TerminalConfig)
 		secretKey = cfg.SecretKey
 
 		if region == "" && endpoint != "" {
-			endpointArray := strings.Split(endpoint, ".")
-			if len(endpointArray) >= 2 {
-				region = endpointArray[1]
-			}
+			region = ParseEndpointRegion(endpoint)
 		}
 		if bucket == "" {
 			bucket = "jumpserver"
@@ -117,8 +123,24 @@ func NewReplayStorage(jmsService *service.JMService, conf *model.TerminalConfig)
 	case "null":
 		return storage.NewNullStorage()
 	default:
-		return storage.ServerStorage{StorageType: "server", JmsService: jmsService}
+		return nil
 	}
+}
+
+func NewReplayStorage(jmsService *service.JMService, conf *model.TerminalConfig) ReplayStorage {
+	replayStorage := GetStorage(conf)
+	if replayStorage == nil {
+		replayStorage = storage.ServerStorage{StorageType: "server", JmsService: jmsService}
+	}
+	return replayStorage
+}
+
+func NewFTPFileStorage(jmsService *service.JMService, conf *model.TerminalConfig) FTPFileStorage {
+	ftpStorage := GetStorage(conf)
+	if ftpStorage == nil {
+		ftpStorage = storage.FTPServerStorage{StorageType: "server", JmsService: jmsService}
+	}
+	return ftpStorage
 }
 
 func NewCommandStorage(jmsService *service.JMService, conf *model.TerminalConfig) CommandStorage {
@@ -132,7 +154,7 @@ func NewCommandStorage(jmsService *service.JMService, conf *model.TerminalConfig
 		'DOC_TYPE': 'command',
 		  'HOSTS': ['http://172.16.10.122:9200'],
 		  'INDEX': 'jumpserver',
-		  'OTHER': {'IGNORE_VERIFY_CERTS': True},
+		  'OTHER': {'IGNORE_VERIFY_CERTS': True, 'IS_INDEX_DATASTREAM': True},
 		  'TYPE': 'es'
 		}
 	*/
@@ -143,11 +165,15 @@ func NewCommandStorage(jmsService *service.JMService, conf *model.TerminalConfig
 			hosts[i] = item.(string)
 		}
 		var skipVerify bool
+		var isDataStream bool
 		index := cf["INDEX"].(string)
 		docType := cf["DOC_TYPE"].(string)
 		if otherMap, ok := cf["OTHER"].(map[string]interface{}); ok {
 			if insecureSkipVerify, ok := otherMap["IGNORE_VERIFY_CERTS"]; ok {
 				skipVerify = insecureSkipVerify.(bool)
+			}
+			if isIndexDataStream, ok := otherMap["IS_INDEX_DATASTREAM"]; ok {
+				isDataStream = isIndexDataStream.(bool)
 			}
 		}
 		if index == "" {
@@ -160,11 +186,76 @@ func NewCommandStorage(jmsService *service.JMService, conf *model.TerminalConfig
 			Hosts:              hosts,
 			Index:              index,
 			DocType:            docType,
+			IsDataStream:       isDataStream,
 			InsecureSkipVerify: skipVerify,
 		}
+	case "influxdb":
+		var (
+			serverURL   string
+			authToken   string
+			bucket      string
+			measurement string
+		)
+		if sURL, ok1 := cf["SERVER_URL"].(string); ok1 {
+			serverURL = sURL
+		}
+		if token, ok1 := cf["AUTH_TOKEN"].(string); ok1 {
+			authToken = token
+		}
+		if bucketValue, ok1 := cf["BUCKET"].(string); ok1 {
+			bucket = bucketValue
+		}
+		if measurementValue, ok1 := cf["MEASUREMENT"].(string); ok1 {
+			measurement = measurementValue
+		}
+		if bucket == "" {
+			bucket = "jumpserver"
+		}
+		if measurement == "" {
+			measurement = "commands"
+		}
+		return storage.InfluxdbStorage{
+			ServerURL:   serverURL,
+			AuthToken:   authToken,
+			Bucket:      bucket,
+			Measurement: measurement,
+		}
+
 	case "null":
 		return storage.NewNullStorage()
 	default:
 		return storage.ServerStorage{StorageType: "server", JmsService: jmsService}
 	}
 }
+
+func ParseEndpointRegion(s string) string {
+	if strings.Contains(s, amazonawsSuffix) {
+		return ParseAWSURLRegion(s)
+	}
+	endpoint, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	endpoints := strings.Split(endpoint.Hostname(), ".")
+	if len(endpoints) >= 3 {
+		return endpoints[len(endpoints)-3]
+	}
+	return endpoints[0]
+}
+
+func ParseAWSURLRegion(s string) string {
+	endpoint, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	s = endpoint.Hostname()
+	s = strings.TrimSuffix(s, amazonawsCNSuffix)
+	s = strings.TrimSuffix(s, amazonawsSuffix)
+	regions := strings.Split(s, ".")
+	return regions[len(regions)-1]
+}
+
+const (
+	amazonawsCNSuffix = ".amazonaws.com.cn"
+	amazonawsSuffix   = ".amazonaws.com"
+)

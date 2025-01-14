@@ -1,12 +1,18 @@
 package srvconn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	authorizationv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/jumpserver/koko/pkg/config"
 	"github.com/jumpserver/koko/pkg/localcommand"
@@ -22,31 +28,33 @@ var (
 
 const (
 	k8sInitFilename = "init-kubectl.sh"
-
-	checkTokenCommand = `kubectl --insecure-skip-tls-verify=%s --token=%s --server=%s auth can-i get pods`
 )
 
-func isValidK8sUserToken(o *k8sOptions) bool {
-	skipVerifyTls := "true"
-	token := o.Token
-	server := o.ClusterServer
-	if !o.IsSkipTls {
-		skipVerifyTls = "false"
-	}
-	c := exec.Command("bash", "-c",
-		fmt.Sprintf(checkTokenCommand, skipVerifyTls, token, server))
-	out, err := c.CombinedOutput()
+// 类似于 `kubectl --insecure-skip-tls-verify=%s --token=%s --server=%s auth can-i get pods`
+
+func IsValidK8sUserToken(o *k8sOptions) bool {
+	k8sCfg := o.K8sCfg()
+	client, err := kubernetes.NewForConfig(k8sCfg)
 	if err != nil {
-		logger.Info(err)
+		logger.Errorf("K8sCon new config err: %s", err)
+		return false
 	}
-	result := strings.TrimSpace(string(out))
-	switch strings.ToLower(result) {
-	case "yes", "no":
-		logger.Info("K8sCon check token success")
-		return true
+	sar := &authorizationv1.SelfSubjectAccessReview{
+		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authorizationv1.ResourceAttributes{
+				Verb:     "get",
+				Resource: "pods",
+			},
+		},
 	}
-	logger.Errorf("K8sCon check token err: %s", result)
-	return false
+	authClient := client.AuthorizationV1()
+	resp, err2 := authClient.SelfSubjectAccessReviews().Create(context.TODO(), sar, metav1.CreateOptions{})
+	if err2 != nil {
+		logger.Errorf("K8sCon check token pods auth err: %s", err2)
+		return false
+	}
+	logger.Debugf("K8sCon check token pods auth resp: %+v", resp)
+	return true
 }
 
 func NewK8sConnection(ops ...K8sOption) (*K8sCon, error) {
@@ -60,7 +68,7 @@ func NewK8sConnection(ops ...K8sOption) (*K8sCon, error) {
 	for _, setter := range ops {
 		setter(args)
 	}
-	if !isValidK8sUserToken(args) {
+	if !IsValidK8sUserToken(args) {
 		return nil, InValidToken
 	}
 	_, err := utils.Encrypt(args.Token, config.CipherKey)
@@ -100,6 +108,17 @@ type k8sOptions struct {
 	win Windows
 }
 
+func (o *k8sOptions) K8sCfg() *rest.Config {
+	kubeConf := &rest.Config{
+		Host:        o.ClusterServer,
+		BearerToken: o.Token,
+	}
+	if o.IsSkipTls {
+		kubeConf.Insecure = true
+	}
+	return kubeConf
+}
+
 func (o *k8sOptions) Env() []string {
 	token, err := utils.Encrypt(o.Token, config.CipherKey)
 	if err != nil {
@@ -110,12 +129,15 @@ func (o *k8sOptions) Env() []string {
 	if !o.IsSkipTls {
 		skipTls = "false"
 	}
+	k8sName := strings.Trim(strconv.Quote(o.ExtraEnv["K8sName"]), "\"")
+	k8sName = strings.ReplaceAll(k8sName, "`", "\\`")
 	return []string{
 		fmt.Sprintf("KUBECTL_USER=%s", o.Username),
 		fmt.Sprintf("KUBECTL_CLUSTER=%s", o.ClusterServer),
 		fmt.Sprintf("KUBECTL_INSECURE_SKIP_TLS_VERIFY=%s", skipTls),
 		fmt.Sprintf("K8S_ENCRYPTED_TOKEN=%s", token),
 		fmt.Sprintf("WELCOME_BANNER=%s", config.KubectlBanner),
+		fmt.Sprintf("K8S_NAME=%s", k8sName),
 	}
 }
 
